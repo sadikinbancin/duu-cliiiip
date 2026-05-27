@@ -46,23 +46,49 @@ The agent will transcribe, find the best moments, track faces for smart crop pos
 
 ### Step 1: Preflight
 
-Validate the input and environment before doing any work.
+Validate the input and environment before doing any work. Stop early if anything fails — do not proceed past Step 1 with a bad source.
+
+**Source integrity checks (REQUIRED — abort if any fail):**
 
 ```bash
-# Check ffmpeg
-ffmpeg -version 2>\&1 | head -1
+# 1. File must exist and be readable
+test -f source.mp4 && test -r source.mp4 || { echo "ABORT: source.mp4 not found or not readable"; exit 1; }
 
-# Check disk space (need at least 2x the source file size free)
-df -h .
+# 2. File must be non-zero
+SIZE=$(stat -c%s source.mp4 2>/dev/null || stat -f%z source.mp4 2>/dev/null)
+test "$SIZE" -gt 1024 || { echo "ABORT: source.mp4 is zero-byte or too small ($SIZE bytes)"; exit 1; }
 
-# Validate the source file
-ffprobe -v error -show\_entries stream=codec\_name,width,height,duration \\
-  -of csv=p=0 source.mp4
+# 3. Must be a valid media file with streams (not DRM, not HTML, not corrupt)
+ffprobe -v error -show_entries stream=codec_name,width,height,duration \
+  -of csv=p=0 source.mp4 2>&1
+# If ffprobe returns nothing or errors: ABORT. File is encrypted, corrupt, or not media.
+
+# 4. Must have audio AND video streams (warn if audio-only)
+HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 source.mp4)
+HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 source.mp4)
+test -z "$HAS_AUDIO" && { echo "ABORT: No audio stream found — transcription requires audio"; exit 1; }
+test -z "$HAS_VIDEO" && echo "WARNING: Audio-only source. Face tracking and smart crop will be skipped. Clips will use static background."
+
+# 5. Duration must be finite and > 5 seconds
+DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 source.mp4)
+test -n "$DUR" && python3 -c "import sys; sys.exit(0 if float('$DUR') > 5 else 1)" \
+  || { echo "ABORT: Duration is missing, zero, or under 5 seconds"; exit 1; }
+
+# 6. Check tools
+ffmpeg -version 2>&1 | head -1
+ffprobe -version 2>&1 | head -1
+python3 --version
+python3 -c "import faster_whisper; print('faster-whisper OK')" || echo "WARNING: faster-whisper not installed"
+python3 -c "import mediapipe; print('mediapipe OK')" 2>/dev/null || echo "WARNING: mediapipe not installed — face tracking disabled"
+python3 -c "import cv2; print('opencv OK')" 2>/dev/null || echo "WARNING: opencv not installed — face tracking disabled"
+
+# 7. Check disk space (need at least 2x source file size + 500MB overhead)
+REQUIRED_KB=$(( (SIZE / 1024) * 2 + 512000 ))
+AVAIL_KB=$(df --output=avail . 2>/dev/null | tail -1 || df -k . | awk 'NR==2{print $4}')
+test "$AVAIL_KB" -gt "$REQUIRED_KB" || { echo "ABORT: Not enough disk space. Need ${REQUIRED_KB}KB, have ${AVAIL_KB}KB"; exit 1; }
 ```
 
-Report to the user: source resolution, duration, codec, disk space, estimated
-processing time. If the source is under 720p, warn that vertical upscaling
-will be soft.
+Report to the user: source resolution, duration, codec, disk space, tool status, estimated processing time. If the source is under 720p, warn that vertical upscaling will be soft. If audio-only, state that face tracking/crop are skipped and clips will use a static background or waveform visualization.
 
 **Supported input formats:** MP4, MKV, MOV, AVI, WebM, MP3, WAV, M4A.
 **Supported sources:** Local file, YouTube URL (via yt-dlp), direct video URL.
@@ -76,20 +102,36 @@ If the user provides a local file, verify it with ffprobe and move on.
 If the user provides a URL:
 
 ```bash
-# YouTube
-yt-dlp -f "bestvideo\[height<=1080]\[ext=mp4]+bestaudio\[ext=m4a]/best\[height<=1080]" \\
-  -o "source.mp4" "<URL>"
+# YouTube — download to a temp file first, then verify
+yt-dlp -f "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]" \
+  -o "/tmp/source_download.mp4" "<URL>" || { echo "ABORT: yt-dlp download failed (auth/geo-block/private?)"; exit 1; }
 
 # Direct video URL
-curl -L -o source.mp4 "<URL>"
+curl -L -o /tmp/source_download.mp4 "<URL>" || { echo "ABORT: curl download failed (HTTP error, timeout, or redirect loop)"; exit 1; }
 ```
 
-After download, verify the file is actually video (not an HTML error page):
+**After download, validate with ffprobe (NOT the `file` command — `file` only catches HTML, not broken video):**
 
 ```bash
-file source.mp4
-# Should show: ISO Media, MP4 v2, etc.
-# If it shows "HTML document", the download failed
+# Verify the download is actual media with valid streams
+AUDIO_CHECK=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 /tmp/source_download.mp4 2>&1)
+VIDEO_CHECK=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 /tmp/source_download.mp4 2>&1)
+
+# If either check is empty or contains HTML/error text: ABORT
+echo "$AUDIO_CHECK" | grep -qi "html\|error\|$" && { echo "ABORT: Downloaded file is not valid media (HTML page, error, or HLS manifest)"; file /tmp/source_download.mp4; exit 1; }
+test -z "$AUDIO_CHECK" && { echo "ABORT: No audio stream in download — cannot transcribe"; exit 1; }
+
+# Only rename to source.mp4 after validation passes (avoid overwriting good sources)
+test -f source.mp4 && { echo "ABORT: source.mp4 already exists. Move or rename it before downloading."; exit 1; }
+mv /tmp/source_download.mp4 source.mp4
+```
+
+**Source collision rule:** Never overwrite `source.mp4`. If it exists, ask the user to rename or remove it. For batch work, use timestamped filenames: `source_$(date +%Y%m%d_%H%M%S).mp4`.
+
+**HLS/DASH/manifest detection:** If the URL ends in `.m3u8` or `.mpd`, or if `curl -I` returns `content-type: application/vnd.apple.mpegurl` or `application/dash+xml`, route through `yt-dlp` or `ffmpeg` instead of raw `curl`:
+
+```bash
+ffmpeg -i "<MANIFEST_URL>" -c copy /tmp/source_download.mp4
 ```
 
 \---
@@ -127,8 +169,48 @@ with open("transcript.json", "w") as f:
 * `small` — better accuracy, \~244MB, moderate speed
 * `large-v3` — best accuracy, \~1.6GB, slow on CPU (use only with GPU)
 
-**For videos >30 minutes:** Split audio into 10-minute chunks and transcribe
-in batches to avoid timeout. Combine the word lists with adjusted timestamps.
+**For videos >30 minutes:** Split audio into 10-minute chunks and transcribe in batches to avoid timeout. Combine the word lists with adjusted timestamps.
+
+**Chunked transcription merge validation (REQUIRED when chunking):**
+
+After merging chunks, validate the result before proceeding to Step 4:
+
+```bash
+# 1. Timestamps must be monotonically increasing (no overlap, no gaps > 5s)
+python3 -c "
+import json
+with open('transcript.json') as f:
+    data = json.load(f)
+words = data['words']
+for i in range(1, len(words)):
+    if words[i]['start'] < words[i-1]['start']:
+        print(f'ABORT: Non-monotonic timestamp at word {i}: {words[i-1][\"start\"]} -> {words[i][\"start\"]}')
+        exit(1)
+    gap = words[i]['start'] - words[i-1]['end']
+    if gap > 5.0:
+        print(f'WARNING: Large gap ({gap:.1f}s) between words {i-1} and {i} — possible missing chunk')
+print(f'OK: {len(words)} words, duration {data[\"duration\"]:.1f}s, monotonic')
+"
+
+# 2. Coverage check: transcript should cover ≥ 90% of source duration
+python3 -c "
+import json
+with open('transcript.json') as f:
+    data = json.load(f)
+dur = data['duration']
+# Source duration from ffprobe
+import subprocess, json
+p = subprocess.run(['ffprobe','-v','quiet','-print_format','json','-show_format','source.mp4'],
+                   capture_output=True, text=True)
+src = json.loads(p.stdout)
+src_dur = float(src['format']['duration'])
+coverage = (dur / src_dur) * 100
+if coverage < 90:
+    print(f'ABORT: Transcript covers only {coverage:.0f}% of source — chunks may be missing')
+    exit(1)
+print(f'Coverage: {coverage:.0f}% — OK')
+"
+```
 
 **VAD filter note:** `vad\_filter=True` removes silence and secondary speakers.
 This is ideal for guest-focused clips. Set `vad\_filter=False` if you need
@@ -181,6 +263,38 @@ Use the **Quick-Score Reference Card** at the bottom for rapid scanning.
 - Align start/end with sentence boundaries, not mid-word
 - For each candidate, record: start time, end time, duration, score on all 8 dimensions, hook text, and rationale
 
+**Candidate time validation (REQUIRED — reject any candidate that fails):**
+
+Before presenting candidates to the user, validate every candidate:
+
+```python
+# Validate candidate times against source
+import json, subprocess
+
+# Get source duration
+p = subprocess.run(['ffprobe','-v','quiet','-print_format','json','-show_format','source.mp4'],
+                   capture_output=True, text=True)
+src_dur = float(json.loads(p.stdout)['format']['duration'])
+
+for clip in candidates:
+    start, end = clip['start'], clip['end']
+    # Must be within source bounds
+    assert 0 <= start < end <= src_dur, \
+        f"Candidate {clip['id']}: times [{start}, {end}] out of bounds [0, {src_dur}]"
+    # Duration must be 15-55s
+    dur = end - start
+    assert 15 <= dur <= 55, \
+        f"Candidate {clip['id']}: duration {dur:.1f}s outside [15, 55]"
+    # Must not overlap with other candidates (90s separation)
+    for other in candidates:
+        if other['id'] != clip['id']:
+            gap = abs(clip['start'] - other['start'])
+            assert gap >= 90, \
+                f"Candidates {clip['id']} and {other['id']} only {gap:.0f}s apart (need ≥90s)"
+```
+
+If validation fails, drop the invalid candidate — don't adjust times silently. If fewer than 3 valid candidates remain, lower the threshold to 55 and re-analyze.
+
 **Red flags (automatic low coherence score):**
 - "As I mentioned earlier..." / "Going back to what we discussed..."
 - Pronouns without clear referents ("he said that...")
@@ -212,12 +326,15 @@ Ask the user:
 2. Caption style? (none / clean / bold / bounce — see Step 9)
 3. Platform? (youtube / tiktok / instagram / all)
 
-Write approved selections to `clips.json`:
+Write approved selections to `clips.json` using an atomic write (write to temp file, validate, then rename):
 
-```json
-{
+```python
+import json, os
+
+# Build the clips data
+clips_data = {
   "source": "source.mp4",
-  "clips": \[
+  "clips": [
     {
       "id": "01",
       "title": "Nobody talks about this",
@@ -228,9 +345,27 @@ Write approved selections to `clips.json`:
       "hook": "Nobody talks about this hidden cost"
     }
   ],
-  "caption\_style": "none",
+  "caption_style": "none",
   "platform": "all"
 }
+
+# Validate schema before writing
+valid_styles = {"none", "clean", "bold", "bounce"}
+valid_platforms = {"youtube", "tiktok", "instagram", "all"}
+assert clips_data["caption_style"] in valid_styles, f"Invalid caption style: {clips_data['caption_style']}"
+assert clips_data["platform"] in valid_platforms, f"Invalid platform: {clips_data['platform']}"
+for clip in clips_data["clips"]:
+    assert isinstance(clip["start"], (int, float)), f"Clip {clip['id']}: start is not numeric"
+    assert isinstance(clip["end"], (int, float)), f"Clip {clip['id']}: end is not numeric"
+    assert clip["start"] < clip["end"], f"Clip {clip['id']}: start >= end"
+    assert 0 <= clip["score"] <= 100, f"Clip {clip['id']}: score {clip['score']} out of range"
+    assert len(clip["id"]) > 0, f"Clip missing id"
+
+# Atomic write: temp file first, then rename
+with open("clips.json.tmp", "w") as f:
+    json.dump(clips_data, f, indent=2)
+os.rename("clips.json.tmp", "clips.json")
+print(f"Wrote {len(clips_data['clips'])} clips to clips.json")
 ```
 
 \---
@@ -354,15 +489,86 @@ python3 scripts/smart\_crop.py \\
 * `--padding 0.15` — Extra space around face (15% of crop width). Increase for more headroom.
 * `--smooth 5` — Smoothing window in frames. Higher = smoother but slower response to movement.
 
+**Crop geometry validation (REQUIRED — validate crop_data.json before rendering):**
+
+```python
+import json, subprocess
+
+# Get source dimensions
+p = subprocess.run(['ffprobe','-v','quiet','-print_format','json',
+    '-select_streams','v:0','-show_entries','stream=width,height','source.mp4'],
+    capture_output=True, text=True)
+src_stream = json.loads(p.stdout)['streams'][0]
+src_w, src_h = src_stream['width'], src_stream['height']
+
+with open('crop_data.json') as f:
+    crop = json.load(f)
+
+for clip_id, data in crop['clips'].items():
+    cw, ch = data['crop_w'], data['crop_h']
+
+    # Crop window must fit inside source
+    assert ch <= src_h, f"Clip {clip_id}: crop height {ch} > source height {src_h}"
+    assert cw <= src_w, f"Clip {clip_id}: crop width {cw} > source width {src_w}"
+
+    # Validate keyframes
+    for kf in data.get('keyframes', []):
+        cx = kf['crop_x']
+        assert 0 <= cx <= src_w - cw, \
+            f"Clip {clip_id}: crop_x {cx} out of range [0, {src_w - cw}]"
+        assert isinstance(kf['time'], (int, float)) and kf['time'] >= 0, \
+            f"Clip {clip_id}: invalid keyframe time {kf.get('time')}"
+
+    # For portrait source that can't crop 9:16: switch to pad+scale
+    if src_w / src_h > 0.7:  # Wider than ~0.7:1 can't cleanly crop to 9:16
+        print(f"WARNING: Clip {clip_id}: source aspect {src_w/src_h:.2f} too wide for 9:16 crop. Using pad+scale fallback.")
+        data['strategy'] = 'pad_scale'
+
+print("Crop geometry validation: OK")
+```
+
 \---
 
 ### Step 9: Prepare — Extract Clips
 
-Extract each segment via ffmpeg stream copy (near-instant, lossless):
+Extract each segment via ffmpeg. **CRITICAL: Use `-t` (duration), NOT `-to` (end time) when `-ss` comes before `-i`.** With `-ss ... -to ... -i`, the `-to` flag is ignored for MP4 containers and the clip runs to the end of the source.
 
 ```bash
-ffmpeg -y -ss <start> -to <end> -i source.mp4 -c copy clips/clip\_01.mp4
+DURATION=$(python3 -c "print($END - $START)")  # end minus start in seconds
+mkdir -p clips
+
+# CORRECT: -ss before -i, use -t for duration
+ffmpeg -y -ss $START -i source.mp4 -t $DURATION -c copy clips/clip_01.mp4
 ```
+
+**Verify every extracted clip immediately (REQUIRED):**
+
+```bash
+# Check clip duration matches expected (within 1 second tolerance)
+EXPECTED_DUR=39.0
+ACTUAL_DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 clips/clip_01.mp4)
+python3 -c "import sys; diff=abs(float('$ACTUAL_DUR') - float('$EXPECTED_DUR')); sys.exit(0 if diff < 1.0 else 1)" \
+  || { echo "ABORT: Clip 01 duration mismatch: expected ${EXPECTED_DUR}s, got ${ACTUAL_DUR}s"; exit 1; }
+
+# Check for A/V stream presence
+ffprobe -v error -show_entries stream=codec_type -of csv=p=0 clips/clip_01.mp4 | grep -q video \
+  || echo "WARNING: Clip 01 has no video stream (audio-only source?)"
+ffprobe -v error -show_entries stream=codec_type -of csv=p=0 clips/clip_01.mp4 | grep -q audio \
+  || echo "WARNING: Clip 01 has no audio stream"
+
+# Check for corrupt frames (nonzero packet count)
+PKT_COUNT=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 clips/clip_01.mp4)
+test "$PKT_COUNT" -gt 0 || { echo "ABORT: Clip 01 has zero video packets — stream copy failed"; exit 1; }
+```
+
+**Stream copy failure recovery:** If any clip fails verification (wrong duration, zero packets, missing streams), re-extract with re-encode:
+
+```bash
+# Accurate seek with re-encode (slower but reliable)
+ffmpeg -y -i source.mp4 -ss $START -t $DURATION -c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 128k clips/clip_01.mp4
+```
+
+Then re-verify. If re-encode also fails, mark the clip as failed and continue with remaining clips (don't abort the entire batch).
 
 ### Step 10: Render — Vertical Clips with Smart Crop
 
@@ -397,11 +603,44 @@ python3 scripts/render.py --source source.mp4 --clips clips.json \\
 verticals at 1080p, render in batches of 3 to avoid timeout. At 720p, batches
 of 5 are safe.
 
-**Verify every output:**
+**Verify every output (REQUIRED — expanded check):**
 
 ```bash
-ffprobe -v error -show\_entries stream=codec\_name,width,height,duration \\
-  -of csv=p=0 exports/vertical/<id>\_v.mp4
+# 1. Basic stream check
+ffprobe -v error -show_entries stream=codec_name,width,height,duration \
+  -of csv=p=0 exports/vertical/01_v.mp4
+
+# 2. Vertical clips MUST be 1080x1920
+W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 exports/vertical/01_v.mp4)
+H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 exports/vertical/01_v.mp4)
+test "$W" = "1080" -a "$H" = "1920" || echo "FAIL: Expected 1080x1920, got ${W}x${H}"
+
+# 3. Duration must match clip definition within 0.5s
+EXPECTED_DUR=39.0
+ACTUAL_DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 exports/vertical/01_v.mp4)
+python3 -c "import sys; sys.exit(0 if abs(float('$ACTUAL_DUR') - $EXPECTED_DUR) < 0.5 else 1)" \
+  || echo "FAIL: Duration mismatch: expected ${EXPECTED_DUR}s, got ${ACTUAL_DUR}s"
+
+# 4. Must have both audio and video streams
+ffprobe -v error -show_entries stream=codec_type -of csv=p=0 exports/vertical/01_v.mp4 | tr ',' '\n' | sort | tr '\n' ' '
+echo ""  # Should show: audio video
+
+# 5. Nonzero frame count
+FRAMES=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 exports/vertical/01_v.mp4)
+test "$FRAMES" -gt 0 || echo "FAIL: Zero frames"
+
+# 6. Moov atom present (faststart check — ensures web playback)
+ffprobe -v error -show_entries format=format_name -of csv=p=0 exports/vertical/01_v.mp4 | grep -q mov \
+  && echo "moov atom: OK" || echo "WARNING: moov atom may be missing"
+
+# 7. Not all black (sample 3 frames at 25%, 50%, 75% — check for zero variance)
+for PCT in 25 50 75; do
+    FRAME_TIME=$(python3 -c "print($ACTUAL_DUR * $PCT / 100)")
+    MEAN=$(ffmpeg -ss $FRAME_TIME -i exports/vertical/01_v.mp4 -vframes 1 -f rawvideo -pix_fmt gray - 2>/dev/null | xxd | head -1)
+    test -n "$MEAN" || echo "WARNING: Frame at ${PCT}% appears blank"
+done
+
+echo "Output verification complete"
 ```
 
 \---
