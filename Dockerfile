@@ -13,9 +13,19 @@ RUN apt-get update \
        libgl1 \
        fonts-dejavu-core \
        ca-certificates \
+       curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+RUN mkdir -p /app/models \
+    && curl -L --fail --retry 3 \
+       "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" \
+       -o /app/models/face_landmarker.task \
+    && test -s /app/models/face_landmarker.task
+
+ENV MEDIAPIPE_MODEL_PATH=/app/models/face_landmarker.task
+
 
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
