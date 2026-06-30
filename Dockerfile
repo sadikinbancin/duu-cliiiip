@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/tmp/hf-cache
+    HF_HOME=/tmp/hf-cache \
+    MEDIAPIPE_MODEL_PATH=/app/models/face_landmarker.task
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -11,6 +12,7 @@ RUN apt-get update \
        tesseract-ocr-eng \
        libglib2.0-0 \
        libgl1 \
+       libgomp1 \
        fonts-dejavu-core \
        ca-certificates \
        curl \
@@ -23,9 +25,6 @@ RUN mkdir -p /app/models \
        "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" \
        -o /app/models/face_landmarker.task \
     && test -s /app/models/face_landmarker.task
-
-ENV MEDIAPIPE_MODEL_PATH=/app/models/face_landmarker.task
-
 
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel \
