@@ -59,7 +59,6 @@ def prepare_video(uploaded_video, drive_url):
             url=drive_url,
             output=output_path,
             quiet=False,
-            fuzzy=True,
         )
     except Exception as exc:
         raise gr.Error(
