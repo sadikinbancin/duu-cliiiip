@@ -190,6 +190,99 @@ def probe_video(video: Path) -> dict:
     }
 
 
+
+def normalize_source(video: Path, meta: dict, job: Path):
+    """Convert fragile codecs such as AV1 to stable H.264 before seeking/cropping.
+
+    Random seeking into AV1 can begin between sequence headers and produce green,
+    gray, or blocky frames. Normalizing once from the beginning avoids that and
+    gives OpenCV/MediaPipe a seek-friendly H.264 source.
+    """
+    codec = str(meta.get("video_codec") or "").lower()
+    force = os.getenv("FORCE_NORMALIZE_VIDEO", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    needs_normalize = force or codec not in {"h264", "avc1"}
+
+    if not needs_normalize:
+        return video, meta, False, f"Codec {codec or 'unknown'} sudah aman; normalisasi dilewati."
+
+    output = job / "source_normalized_h264.mp4"
+    log_path = job / "normalization.log"
+    attempts = []
+
+    decoder_options = [["-c:v", "libdav1d"], []] if codec == "av1" else [[]]
+
+    for decoder in decoder_options:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
+            *decoder,
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*2)",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            "-max_muxing_queue_size",
+            "2048",
+            str(output),
+        ]
+
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            check=False,
+        )
+        decoder_name = "libdav1d" if decoder else "FFmpeg default decoder"
+        attempts.append(
+            f"=== {decoder_name} | exit={process.returncode} ===\n"
+            f"{process.stderr[-12000:]}\n"
+        )
+
+        if process.returncode == 0 and output.is_file() and output.stat().st_size > 0:
+            log_path.write_text("\n".join(attempts), encoding="utf-8")
+            normalized_meta = probe_video(output)
+            return (
+                output,
+                normalized_meta,
+                True,
+                f"{codec.upper() or 'VIDEO'} dinormalisasi ke H.264/yuv420p.",
+            )
+
+        output.unlink(missing_ok=True)
+
+    log_path.write_text("\n".join(attempts), encoding="utf-8")
+    raise RuntimeError(
+        f"Normalisasi codec {codec or 'unknown'} gagal. Lihat normalization.log."
+    )
+
+
 def extract_audio(video: Path, job: Path) -> Path:
     output = job / "audio.mp3"
     run(
@@ -977,9 +1070,11 @@ def render_all(
             "-c:v",
             "libx264",
             "-preset",
-            "ultrafast",
+            "veryfast",
             "-crf",
-            "28",
+            "21",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
@@ -1023,9 +1118,11 @@ def render_all(
                     "-c:v",
                     "libx264",
                     "-preset",
-                    "ultrafast",
+                    "veryfast",
                     "-crf",
-                    "28",
+                    "21",
+                    "-pix_fmt",
+                    "yuv420p",
                     "-c:a",
                     "aac",
                     "-b:a",
@@ -1079,21 +1176,33 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
     try:
         states[current] = "running"
         yield snap("Menyiapkan sumber video...")
-        video = prepare_source(upload, drive_url, job)
-        preview = str(video)
+        source_video = prepare_source(upload, drive_url, job)
+        preview = str(source_video)
         states[current] = "done"
-        yield snap(f"Video siap: {video.stat().st_size / 1024 / 1024:.1f} MB")
+        yield snap(f"Video siap: {source_video.stat().st_size / 1024 / 1024:.1f} MB")
 
         current = STAGES[1]
         states[current] = "running"
-        yield snap("Membaca metadata dan mengekstrak audio...")
-        meta = probe_video(video)
+        yield snap("Membaca codec dan menormalkan video bila diperlukan...")
+        source_meta = probe_video(source_video)
+        (job / "source_metadata.json").write_text(
+            json.dumps(source_meta, indent=2), encoding="utf-8"
+        )
+        video, meta, normalized, normalize_note = normalize_source(
+            source_video, source_meta, job
+        )
+        preview = str(video)
         if not meta["has_audio"]:
             raise RuntimeError("Video tidak memiliki audio.")
         audio = extract_audio(video, job)
-        (job / "metadata.json").write_text(json.dumps(meta, indent=2))
+        (job / "metadata.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
         states[current] = "done"
-        yield snap(f"{meta['width']}×{meta['height']}, {meta['duration']:.1f} detik")
+        yield snap(
+            f"{normalize_note} {meta['width']}×{meta['height']}, "
+            f"{meta['duration']:.1f} detik."
+        )
 
         current = STAGES[2]
         states[current] = "running"
@@ -1218,6 +1327,8 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         yield snap("Membuat ZIP hasil dan log debug...")
         debug_files = [
             job / "runtime_config.json",
+            job / "source_metadata.json",
+            job / "normalization.log",
             job / "metadata.json",
             job / "transcript.json",
             job / "scenes.json",
@@ -1253,7 +1364,7 @@ with gr.Blocks(title="Clipping Lite Stage 2") as demo:
         """
         # 🎬 Clipping Lite — Stage 2
 
-        **Drive/Upload → Groq Whisper → Scene/Audio/OCR → Groq Llama →
+        **Drive/Upload → AV1/H.265 Normalizer → Groq Whisper → Scene/Audio/OCR → Groq Llama →
         MediaPipe Face Tracking → Animated Smart Crop → Subtitle → Render**
         """
     )
