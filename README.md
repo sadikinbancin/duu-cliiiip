@@ -1,4 +1,3 @@
-# Video Podcast Clipper
 ---
 title: Clipping Lite
 emoji: 🎬
@@ -8,6 +7,11 @@ sdk: docker
 pinned: false
 license: mit
 ---
+
+# Video Podcast Clipper
+
+AI auto clipper...
+# Video Podcast Clipper
 
 # Clipping Lite
 
