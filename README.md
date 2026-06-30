@@ -1,4 +1,17 @@
 # Video Podcast Clipper
+---
+title: Clipping Lite
+emoji: 🎬
+colorFrom: purple
+colorTo: blue
+sdk: docker
+pinned: false
+license: mit
+---
+
+# Clipping Lite
+
+AI auto clipper lite for Hugging Face Spaces.
 
 **Turn long-form video into viral vertical clips.** Face-tracked smart crop follows the speaker. An 8-dimension neuro-engagement rubric finds the moments worth clipping. Animated captions in three styles. Works with Claude Code, Cursor, Codex, Hermes, or standalone.
 
