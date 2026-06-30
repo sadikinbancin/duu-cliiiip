@@ -1,0 +1,27 @@
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+
+          git remote add hf https://sadikinbc123:${HF_TOKEN}@huggingface.co/spaces/sadikinbc123/clipping-lite
+          git push hf main:main --force
