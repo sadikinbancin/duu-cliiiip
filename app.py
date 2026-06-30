@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -6,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -450,29 +452,133 @@ def write_clips(selected, job):
 
 
 def mediapipe_crop(video, clips_path, job):
+    """Run MediaPipe and Smart Crop separately so each stage has its own status."""
     face = job / "face_data.json"
     crop = job / "crop_data.json"
-    model = job / "face_landmarker.task"
+    model = Path(
+        os.getenv(
+            "MEDIAPIPE_MODEL_PATH",
+            "/app/models/face_landmarker.task",
+        )
+    )
+
+    mediapipe_ok = False
+    smart_crop_ok = False
+    detected_frames = 0
+    total_frames = 0
+    notes = []
+
+    # Stage 8: MediaPipe
     try:
-        run([
-            "python", "scripts/face_track.py",
+        if not model.is_file() or model.stat().st_size < 100_000:
+            raise RuntimeError(
+                f"Model MediaPipe tidak ditemukan atau rusak: {model}"
+            )
+
+        mp_stdout = run([
+            sys.executable, "scripts/face_track.py",
             "--source", str(video),
             "--clips", str(clips_path),
             "--output", str(face),
             "--fps", "2",
             "--model", str(model),
         ], cwd="/app", timeout=1800)
-        run([
-            "python", "scripts/smart_crop.py",
+
+        (job / "mediapipe_stdout.txt").write_text(
+            mp_stdout or "MediaPipe selesai tanpa stdout.",
+            encoding="utf-8",
+        )
+
+        if not face.is_file() or face.stat().st_size <= 2:
+            raise RuntimeError("face_data.json tidak berhasil dibuat.")
+
+        face_data = json.loads(face.read_text(encoding="utf-8"))
+        for item in face_data.get("clips", {}).values():
+            frames = item.get("frames", [])
+            total_frames += len(frames)
+            detected_frames += sum(
+                1 for frame in frames if frame.get("detected")
+            )
+
+        mediapipe_ok = detected_frames > 0
+        if mediapipe_ok:
+            notes.append(
+                f"MediaPipe: wajah terdeteksi pada "
+                f"{detected_frames}/{total_frames} frame."
+            )
+        else:
+            notes.append(
+                f"MediaPipe berjalan, tetapi tidak menemukan wajah "
+                f"pada {total_frames} frame."
+            )
+
+    except Exception as exc:
+        error_text = (
+            "MEDIA PIPE ERROR\n"
+            f"{type(exc).__name__}: {exc}\n"
+        )
+        (job / "mediapipe_error.txt").write_text(
+            error_text,
+            encoding="utf-8",
+        )
+        notes.append(
+            f"MediaPipe gagal: {type(exc).__name__}: {exc}"
+        )
+        return None, mediapipe_ok, smart_crop_ok, " | ".join(notes)
+
+    # Stage 9: Smart Crop
+    try:
+        crop_stdout = run([
+            sys.executable, "scripts/smart_crop.py",
             "--face-data", str(face),
             "--clips", str(clips_path),
             "--output", str(crop),
             "--source", str(video),
             "--smooth", "5",
         ], cwd="/app", timeout=600)
-        return crop, "MediaPipe aktif"
+
+        (job / "smart_crop_stdout.txt").write_text(
+            crop_stdout or "Smart Crop selesai tanpa stdout.",
+            encoding="utf-8",
+        )
+
+        if not crop.is_file() or crop.stat().st_size <= 2:
+            raise RuntimeError("crop_data.json tidak berhasil dibuat.")
+
+        crop_data = json.loads(crop.read_text(encoding="utf-8"))
+        clip_items = crop_data.get("clips", {})
+        if not clip_items:
+            raise RuntimeError("crop_data.json tidak memiliki data clip.")
+
+        keyframes = sum(
+            len(item.get("keyframes", []))
+            for item in clip_items.values()
+        )
+        smart_crop_ok = True
+        notes.append(
+            f"Smart Crop: {keyframes} keyframe untuk "
+            f"{len(clip_items)} clip."
+        )
+
     except Exception as exc:
-        return None, f"MediaPipe gagal; center crop dipakai: {exc}"
+        error_text = (
+            "SMART CROP ERROR\n"
+            f"{type(exc).__name__}: {exc}\n"
+        )
+        (job / "smart_crop_error.txt").write_text(
+            error_text,
+            encoding="utf-8",
+        )
+        notes.append(
+            f"Smart Crop gagal: {type(exc).__name__}: {exc}"
+        )
+
+    return (
+        crop if smart_crop_ok else None,
+        mediapipe_ok,
+        smart_crop_ok,
+        " | ".join(notes),
+    )
 
 
 def ass_time(sec):
@@ -670,13 +776,21 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         current = STAGES[7]
         states[current] = "running"
         yield snap("MediaPipe melacak wajah...")
-        crop_path, face_note = mediapipe_crop(video, clips_path, job)
-        states[current] = "done" if crop_path else "warning"
+        (
+            crop_path,
+            mediapipe_ok,
+            smart_crop_ok,
+            face_note,
+        ) = mediapipe_crop(video, clips_path, job)
+        states[current] = "done" if mediapipe_ok else "warning"
         yield snap(face_note)
 
         current = STAGES[8]
-        states[current] = "done" if crop_path else "warning"
-        yield snap("Smart crop siap." if crop_path else "Fallback center crop.")
+        states[current] = "done" if smart_crop_ok else "warning"
+        if smart_crop_ok:
+            yield snap(face_note)
+        else:
+            yield snap(f"{face_note} | Render memakai center crop.")
 
         current = STAGES[9]
         states[current] = "running"
@@ -700,6 +814,8 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             job / "metadata.json", job / "transcript.json", job / "scenes.json",
             job / "audio_energy.json", job / "ocr.json", job / "clips.json",
             job / "face_data.json", job / "crop_data.json",
+            job / "mediapipe_stdout.txt", job / "mediapipe_error.txt",
+            job / "smart_crop_stdout.txt", job / "smart_crop_error.txt",
         ]
         archive = make_zip(job, rendered + debug)
         files.append(str(archive))
