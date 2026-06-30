@@ -1,2 +1,10 @@
 gradio
 gdown
+groq
+scenedetect
+opencv-python-headless
+mediapipe
+numpy<2
+Pillow
+pytesseract
+faster-whisper
