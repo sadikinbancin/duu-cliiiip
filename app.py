@@ -20,6 +20,7 @@ import gdown
 import gradio as gr
 import numpy as np
 import pytesseract
+import requests
 from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
@@ -31,6 +32,7 @@ STAGES = [
     "PySceneDetect",
     "Audio dynamics",
     "OCR",
+    "Gemini Vision scoring",
     "Groq Llama viral scoring",
     "MediaPipe",
     "Smart crop",
@@ -58,6 +60,7 @@ def env_config() -> dict:
             "GROQ_LLM_MODEL", "llama-3.3-70b-versatile"
         ).strip(),
         "google_key_present": bool(os.getenv("GOOGLE_API_KEY", "").strip()),
+        "gemini_vision_model": os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip(),
         "mediapipe_model": os.getenv(
             "MEDIAPIPE_MODEL_PATH", "/app/models/face_landmarker.task"
         ).strip(),
@@ -71,7 +74,8 @@ def config_md() -> str:
         f"- Groq API: {'✅ aktif' if cfg['groq_key_present'] else '🟡 belum dipasang'}\n"
         f"- Whisper: `{cfg['groq_whisper_model']}`\n"
         f"- Viral scoring: `{cfg['groq_llm_model']}`\n"
-        f"- Google API: {'✅ tersimpan (untuk tahap Vision berikutnya)' if cfg['google_key_present'] else '⚪ belum dipasang'}\n"
+        f"- Google API: {'✅ aktif untuk Gemini Vision' if cfg['google_key_present'] else '⚪ belum dipasang'}\n"
+        f"- Gemini Vision: `{cfg['gemini_vision_model']}`\n"
         "- MediaPipe: lokal di CPU, tidak memakai API key"
     )
 
@@ -662,6 +666,187 @@ def parse_json(text: str) -> dict:
         return json.loads(match.group(0))
 
 
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def make_candidate_sheet(video: Path, candidate: dict, output: Path) -> Path:
+    """Create a small 3-frame contact sheet for Gemini Vision."""
+    start = float(candidate["start"])
+    end = float(candidate["end"])
+    duration = max(0.1, end - start)
+    times = [
+        start + duration * 0.18,
+        start + duration * 0.50,
+        start + duration * 0.82,
+    ]
+
+    cap = cv2.VideoCapture(str(video))
+    frames = []
+    try:
+        for index, t in enumerate(times, 1):
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            h, w = frame.shape[:2]
+            target_w = 360
+            target_h = max(1, int(h * target_w / max(1, w)))
+            frame = cv2.resize(frame, (target_w, target_h))
+            cv2.putText(
+                frame,
+                f"{candidate['candidate_id']} frame {index}",
+                (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            frames.append(frame)
+    finally:
+        cap.release()
+
+    if not frames:
+        raise RuntimeError(f"Tidak bisa mengambil frame untuk {candidate['candidate_id']}.")
+
+    max_h = max(frame.shape[0] for frame in frames)
+    padded = []
+    for frame in frames:
+        h, w = frame.shape[:2]
+        if h < max_h:
+            pad = np.zeros((max_h - h, w, 3), dtype=np.uint8)
+            frame = np.vstack([frame, pad])
+        padded.append(frame)
+    sheet = np.hstack(padded)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output), sheet, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    return output
+
+
+def gemini_vision_score(video: Path, candidates: list[dict], job: Path):
+    """Use Google Gemini Vision to score visual hook/clarity for candidates."""
+    cfg = env_config()
+    key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if not key:
+        return candidates, "Gemini Vision dilewati: GOOGLE_API_KEY belum dipasang.", False
+
+    # Keep it cheap and fast: analyze only the top candidates from heuristic pre-score.
+    selected = candidates[: min(10, len(candidates))]
+    if not selected:
+        return candidates, "Gemini Vision dilewati: tidak ada kandidat.", False
+
+    image_dir = job / "gemini_vision_frames"
+    parts = [
+        {
+            "text": (
+                "Anda adalah editor short-form video. Nilai kualitas visual setiap kandidat "
+                "berdasarkan hook visual, wajah/ekspresi, gerakan, framing, kejernihan, "
+                "dan apakah cocok jadi short viral. Balas JSON murni saja dengan format: "
+                "{\"items\":[{\"candidate_id\":\"C001\",\"visual_score\":80,"
+                "\"hook_visual\":\"...\",\"visual_summary\":\"...\","
+                "\"risk\":\"...\"}]}"
+            )
+        }
+    ]
+    request_meta = {"model": cfg["gemini_vision_model"], "items": []}
+
+    import base64
+
+    for item in selected:
+        sheet_path = make_candidate_sheet(video, item, image_dir / f"{item['candidate_id']}.jpg")
+        image_b64 = base64.b64encode(sheet_path.read_bytes()).decode("utf-8")
+        request_meta["items"].append(
+            {
+                "candidate_id": item["candidate_id"],
+                "start": item["start"],
+                "end": item["end"],
+                "image": str(sheet_path),
+                "text_preview": item.get("text", "")[:300],
+            }
+        )
+        parts.append({"text": f"Kandidat {item['candidate_id']} | {item['start']}s-{item['end']}s | teks: {item.get('text','')[:500]}"})
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image_b64}})
+
+    (job / "gemini_vision_request.json").write_text(
+        json.dumps(request_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{cfg['gemini_vision_model']}:generateContent"
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "response_mime_type": "application/json",
+        },
+    }
+
+    try:
+        response = requests.post(
+            endpoint,
+            params={"key": key},
+            json=payload,
+            timeout=180,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw_text = ""
+        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+            raw_text += part.get("text", "")
+        (job / "gemini_vision_response.txt").write_text(raw_text, encoding="utf-8")
+        parsed = parse_json(raw_text)
+        items = parsed.get("items", [])
+    except Exception as exc:
+        (job / "gemini_vision_error.txt").write_text(
+            f"{type(exc).__name__}: {exc}", encoding="utf-8"
+        )
+        return candidates, f"Gemini Vision gagal, lanjut tanpa visual score: {type(exc).__name__}: {exc}", False
+
+    visual_map = {}
+    for item in items:
+        cid = str(item.get("candidate_id") or "")
+        if not cid:
+            continue
+        try:
+            score = int(float(item.get("visual_score", 60)))
+        except (TypeError, ValueError):
+            score = 60
+        visual_map[cid] = {
+            "visual_score": int(clamp(score, 0, 100)),
+            "hook_visual": str(item.get("hook_visual") or "")[:250],
+            "visual_summary": str(item.get("visual_summary") or "")[:400],
+            "visual_risk": str(item.get("risk") or "")[:250],
+        }
+
+    enriched = []
+    for item in candidates:
+        new_item = dict(item)
+        visual = visual_map.get(item["candidate_id"])
+        if visual:
+            new_item.update(visual)
+            # Blend visual score into pre-ranking so Llama sees better candidates higher.
+            new_item["preliminary_score"] = round(
+                float(new_item.get("preliminary_score", 0))
+                + visual["visual_score"] / 100.0,
+                4,
+            )
+        else:
+            new_item.setdefault("visual_score", 0)
+            new_item.setdefault("hook_visual", "")
+            new_item.setdefault("visual_summary", "")
+            new_item.setdefault("visual_risk", "")
+        enriched.append(new_item)
+
+    enriched.sort(key=lambda item: item.get("preliminary_score", 0), reverse=True)
+    (job / "gemini_vision.json").write_text(
+        json.dumps({"items": enriched}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return enriched, f"Gemini Vision aktif: {len(visual_map)}/{len(selected)} kandidat dianalisis.", True
+
+
 def groq_rank(candidates: list[dict], count: int, job: Path):
     cfg = env_config()
     key = os.getenv("GROQ_API_KEY", "").strip()
@@ -679,6 +864,10 @@ def groq_rank(candidates: list[dict], count: int, job: Path):
             "scene_changes": item["scene_changes"],
             "audio_energy": item["audio_energy"],
             "ocr": item["ocr"],
+            "visual_score": item.get("visual_score", 0),
+            "hook_visual": item.get("hook_visual", ""),
+            "visual_summary": item.get("visual_summary", ""),
+            "visual_risk": item.get("visual_risk", ""),
         }
         for item in candidates
     ]
@@ -694,6 +883,7 @@ Nilai setiap kandidat dari:
 4. Payoff/penutup yang memuaskan.
 5. Kepadatan informasi dan ritme bicara.
 6. Scene change, energi audio, dan OCR sebagai sinyal pendukung.
+7. Gemini Vision visual_score, hook_visual, visual_summary, dan visual_risk sebagai sinyal visual.
 
 Hindari kandidat yang tumpang tindih. Balas JSON murni dengan format:
 {{"clips":[{{"candidate_id":"C001","score":90,"title":"judul singkat","reason":"alasan pemilihan"}}]}}
@@ -765,6 +955,10 @@ def write_clips(selected: list[dict], job: Path):
                 "title": item.get("title") or f"Highlight {index}",
                 "score": int(item.get("score", 70)),
                 "reason": item.get("reason") or "Heuristic selection",
+                "visual_score": int(item.get("visual_score", 0) or 0),
+                "hook_visual": item.get("hook_visual", ""),
+                "visual_summary": item.get("visual_summary", ""),
+                "visual_risk": item.get("visual_risk", ""),
             }
         )
     payload = {"clips": clips}
@@ -1263,7 +1457,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
 
         current = STAGES[6]
         states[current] = "running"
-        yield snap(f"Menilai kandidat dengan {cfg['groq_llm_model']}...")
+        yield snap(f"Menganalisis visual kandidat dengan {cfg['gemini_vision_model']}...")
         candidates = candidates_of(
             transcript,
             scenes,
@@ -1272,6 +1466,19 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             meta["duration"],
             int(clip_duration),
         )
+        try:
+            candidates, vision_note, used_gemini_vision = gemini_vision_score(
+                video, candidates, job
+            )
+            states[current] = "done" if used_gemini_vision else "warning"
+        except Exception as exc:
+            vision_note = f"Gemini Vision fallback: {type(exc).__name__}: {exc}"
+            states[current] = "warning"
+        yield snap(vision_note)
+
+        current = STAGES[7]
+        states[current] = "running"
+        yield snap(f"Menilai kandidat dengan {cfg['groq_llm_model']} + sinyal Gemini Vision...")
         try:
             selected, score_engine, used_groq_llm = groq_rank(
                 candidates, int(clip_count), job
@@ -1285,7 +1492,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         clips_view = clips
         yield snap(f"{len(clips['clips'])} clip dipilih: {score_engine}")
 
-        current = STAGES[7]
+        current = STAGES[8]
         states[current] = "running"
         yield snap("MediaPipe melacak wajah pada clip terpilih...")
         crop_path, mediapipe_ok, smart_crop_ok, face_note = mediapipe_crop(
@@ -1294,7 +1501,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         states[current] = "done" if mediapipe_ok else "warning"
         yield snap(face_note)
 
-        current = STAGES[8]
+        current = STAGES[9]
         states[current] = "done" if smart_crop_ok else "warning"
         yield snap(
             face_note
@@ -1302,14 +1509,14 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             else f"{face_note} | Render akan memakai center crop."
         )
 
-        current = STAGES[9]
+        current = STAGES[10]
         states[current] = "running"
         yield snap("Membuat subtitle ASS...")
         captions = captions_of(transcript, clips, job)
         states[current] = "done"
         yield snap("Subtitle selesai.")
 
-        current = STAGES[10]
+        current = STAGES[11]
         states[current] = "running"
         yield snap("FFmpeg merender smart crop bergerak 720×1280...")
         rendered, animated_count, fallback_count = render_all(
@@ -1322,7 +1529,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             f"{fallback_count} center-crop fallback."
         )
 
-        current = STAGES[11]
+        current = STAGES[12]
         states[current] = "running"
         yield snap("Membuat ZIP hasil dan log debug...")
         debug_files = [
@@ -1334,6 +1541,10 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             job / "scenes.json",
             job / "audio_energy.json",
             job / "ocr.json",
+            job / "gemini_vision_request.json",
+            job / "gemini_vision_response.txt",
+            job / "gemini_vision_error.txt",
+            job / "gemini_vision.json",
             job / "clips.json",
             job / "face_data.json",
             job / "crop_data.json",
@@ -1344,12 +1555,13 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             job / "smart_crop_stdout.txt",
             job / "smart_crop_error.txt",
         ]
+        debug_files.extend((job / "gemini_vision_frames").glob("*.jpg"))
         debug_files.extend(job.glob("crop_commands_*.txt"))
         debug_files.extend(job.glob("render_animated_error_*.txt"))
         archive = make_zip(job, rendered + debug_files)
         files.append(str(archive))
         states[current] = "done"
-        yield snap("🎉 Tahap 2 selesai: Groq scoring + MediaPipe + animated smart crop aktif.")
+        yield snap("🎉 Tahap 3 selesai: Gemini Vision + Groq scoring + MediaPipe + animated smart crop aktif.")
 
     except Exception as exc:
         states[current] = "error"
@@ -1359,12 +1571,12 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         yield snap(f"ERROR pada tahap **{current}**: {type(exc).__name__}: {exc}")
 
 
-with gr.Blocks(title="Clipping Lite Stage 2") as demo:
+with gr.Blocks(title="Clipping Lite Stage 3") as demo:
     gr.Markdown(
         """
-        # 🎬 Clipping Lite — Stage 2
+        # 🎬 Clipping Lite — Stage 3
 
-        **Drive/Upload → AV1/H.265 Normalizer → Groq Whisper → Scene/Audio/OCR → Groq Llama →
+        **Drive/Upload → AV1/H.265 Normalizer → Groq Whisper → Scene/Audio/OCR → Gemini Vision → Groq Llama →
         MediaPipe Face Tracking → Animated Smart Crop → Subtitle → Render**
         """
     )
@@ -1393,7 +1605,7 @@ with gr.Blocks(title="Clipping Lite Stage 2") as demo:
                     20, 60, value=30, step=5, label="Durasi target"
                 )
             ocr_box = gr.Checkbox(False, label="Aktifkan OCR (lebih lambat)")
-            button = gr.Button("🚀 Proses Full Otomatis Stage 2", variant="primary")
+            button = gr.Button("🚀 Proses Full Otomatis Stage 3", variant="primary")
 
         with gr.Column():
             preview = gr.Video(label="Preview sumber")
