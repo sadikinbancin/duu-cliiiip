@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
@@ -48,6 +49,7 @@ ICON = {
     "error": "❌",
 }
 ROOT = Path(tempfile.gettempdir()) / "clipping-lite-jobs"
+MAX_BATCH_LINKS = max(1, int(os.getenv("MAX_BATCH_LINKS", "20")))
 
 
 def env_config() -> dict:
@@ -1562,70 +1564,408 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         files.append(str(archive))
         states[current] = "done"
         yield snap("🎉 Tahap 3 selesai: Gemini Vision + Groq scoring + MediaPipe + animated smart crop aktif.")
+        return {
+            "ok": True,
+            "job": str(job),
+            "archive": str(archive),
+            "rendered": [str(path) for path in rendered],
+            "clips": clips,
+            "final_stage": current,
+        }
 
     except Exception as exc:
         states[current] = "error"
-        (job / "fatal_error.txt").write_text(
+        error_path = job / "fatal_error.txt"
+        error_path.write_text(
             f"Tahap: {current}\n{type(exc).__name__}: {exc}", encoding="utf-8"
         )
         yield snap(f"ERROR pada tahap **{current}**: {type(exc).__name__}: {exc}")
+        return {
+            "ok": False,
+            "job": str(job),
+            "error_log": str(error_path),
+            "error": f"{type(exc).__name__}: {exc}",
+            "final_stage": current,
+        }
 
 
-with gr.Blocks(title="Clipping Lite Stage 3") as demo:
+def parse_batch_links(raw_text: str) -> list[str]:
+    links = []
+    seen = set()
+    for raw_line in (raw_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        links.append(line)
+    if len(links) > MAX_BATCH_LINKS:
+        raise gr.Error(
+            f"Maksimal {MAX_BATCH_LINKS} link per batch supaya CPU Basic tetap stabil."
+        )
+    return links
+
+
+def drive_file_id(url: str) -> str:
+    patterns = [r"/d/([A-Za-z0-9_-]+)", r"[?&]id=([A-Za-z0-9_-]+)"]
+    for pattern in patterns:
+        match = re.search(pattern, url or "")
+        if match:
+            return match.group(1)[:24]
+    return uuid.uuid5(uuid.NAMESPACE_URL, url or str(uuid.uuid4())).hex[:12]
+
+
+def shorten_url(url: str, limit: int = 64) -> str:
+    clean = (url or "").replace("|", "%7C")
+    if len(clean) <= limit:
+        return clean
+    return clean[:34] + "…" + clean[-24:]
+
+
+def stage_from_status(status_text: str) -> str:
+    for line in (status_text or "").splitlines():
+        if line.startswith("🔵") or line.startswith("❌"):
+            return re.sub(r"[*#]", "", line).strip()
+    for line in (status_text or "").splitlines():
+        if line.startswith("🟡"):
+            return re.sub(r"[*#]", "", line).strip()
+    return "Memproses"
+
+
+def note_from_status(status_text: str) -> str:
+    marker = "**Log terakhir:**"
+    for line in reversed((status_text or "").splitlines()):
+        if marker in line:
+            return line.split(marker, 1)[1].strip()
+    return ""
+
+
+def batch_status_md(items: list[dict], note: str = "") -> str:
+    done = sum(1 for item in items if item["status"] == "done")
+    failed = sum(1 for item in items if item["status"] == "error")
+    running = sum(1 for item in items if item["status"] == "running")
+    lines = [
+        "## 📚 Antrian Batch",
+        f"**Total:** {len(items)} · **Selesai:** {done} · **Gagal:** {failed} · **Berjalan:** {running}",
+        "",
+        "| # | Status | Tahap / keterangan | Link |",
+        "|---:|:---:|---|---|",
+    ]
+    icons = {"pending": "⚪", "running": "🔵", "done": "✅", "error": "❌"}
+    for item in items:
+        detail = str(item.get("detail") or item.get("stage") or "Menunggu").replace("|", "/")
+        if len(detail) > 115:
+            detail = detail[:112] + "…"
+        lines.append(
+            f"| {item['index']} | {icons.get(item['status'], '⚪')} | "
+            f"{detail} | `{shorten_url(item['url'])}` |"
+        )
+    if note:
+        lines.extend(["", f"**Log batch:** {note}"])
+    return "\n".join(lines)
+
+
+def public_batch_summary(items: list[dict]) -> list[dict]:
+    return [
+        {
+            "index": item["index"],
+            "url": item["url"],
+            "status": item["status"],
+            "stage": item.get("stage"),
+            "detail": item.get("detail"),
+            "zip_file": Path(item["archive"]).name if item.get("archive") else None,
+            "error_log": Path(item["error_log"]).name if item.get("error_log") else None,
+        }
+        for item in items
+    ]
+
+
+def write_batch_reports(batch_root: Path, items: list[dict]) -> tuple[Path, Path]:
+    summary_json = batch_root / "batch_summary.json"
+    summary_json.write_text(
+        json.dumps({"items": public_batch_summary(items)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    summary_csv = batch_root / "batch_summary.csv"
+    with summary_csv.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "index", "url", "status", "stage", "detail", "zip_file", "error_log"
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(public_batch_summary(items))
+    return summary_json, summary_csv
+
+
+def make_batch_master_zip(batch_root: Path, files: list[Path]) -> Path:
+    output = batch_root / "batch_all_results.zip"
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for file_path in files:
+            path = Path(file_path)
+            if path.is_file() and path != output:
+                archive.write(path, arcname=path.name)
+    return output
+
+
+def batch_pipeline(batch_links, clip_count, clip_duration, whisper_mode, enable_ocr):
+    cleanup_old_jobs()
+    links = parse_batch_links(batch_links)
+    if not links:
+        raise gr.Error("Masukkan minimal satu link Google Drive, satu link per baris.")
+
+    batch_root = ROOT / f"batch_{uuid.uuid4().hex}"
+    batch_root.mkdir(parents=True, exist_ok=True)
+    items = [
+        {
+            "index": index,
+            "url": url,
+            "status": "pending",
+            "stage": "Menunggu giliran",
+            "detail": "Menunggu giliran",
+            "archive": None,
+            "error_log": None,
+        }
+        for index, url in enumerate(links, 1)
+    ]
+    downloadable = []
+    current_preview = None
+    current_roadmap = "Batch belum dimulai."
+
+    yield (
+        batch_status_md(items, "Antrian dibuat. Proses berjalan satu per satu."),
+        current_preview,
+        current_roadmap,
+        public_batch_summary(items),
+        downloadable,
+    )
+
+    for position, item in enumerate(items):
+        item["status"] = "running"
+        item["stage"] = "Memulai pipeline"
+        item["detail"] = "Menyiapkan video"
+        yield (
+            batch_status_md(items, f"Memproses link {item['index']} dari {len(items)}."),
+            current_preview,
+            current_roadmap,
+            public_batch_summary(items),
+            downloadable,
+        )
+
+        generator = pipeline(
+            None,
+            item["url"],
+            clip_count,
+            clip_duration,
+            whisper_mode,
+            enable_ocr,
+        )
+        final_result = None
+        while True:
+            try:
+                single_update = next(generator)
+            except StopIteration as stop:
+                final_result = stop.value
+                break
+
+            current_roadmap, current_preview, _transcript, _clips, _files = single_update
+            item["stage"] = stage_from_status(current_roadmap)
+            item["detail"] = note_from_status(current_roadmap) or item["stage"]
+            yield (
+                batch_status_md(
+                    items,
+                    f"Link {item['index']}/{len(items)} sedang berjalan — {item['detail']}",
+                ),
+                current_preview,
+                current_roadmap,
+                public_batch_summary(items),
+                downloadable,
+            )
+
+        final_result = final_result or {
+            "ok": False,
+            "error": "Pipeline berhenti tanpa hasil akhir.",
+            "final_stage": item.get("stage"),
+        }
+        short_id = drive_file_id(item["url"])
+
+        if final_result.get("ok"):
+            source_archive = Path(final_result["archive"])
+            copied_archive = batch_root / f"{item['index']:02d}_{short_id}_results.zip"
+            shutil.copy2(source_archive, copied_archive)
+            item["status"] = "done"
+            item["stage"] = "Selesai"
+            item["detail"] = (
+                f"Selesai — {len(final_result.get('rendered') or [])} clip dirender."
+            )
+            item["archive"] = str(copied_archive)
+            downloadable.append(str(copied_archive))
+        else:
+            copied_error = batch_root / f"{item['index']:02d}_{short_id}_error.txt"
+            original_error = Path(final_result.get("error_log") or "")
+            body = [
+                f"Link: {item['url']}",
+                f"Tahap: {final_result.get('final_stage') or item.get('stage')}",
+                f"Error: {final_result.get('error') or 'Unknown error'}",
+            ]
+            if original_error.is_file():
+                body.extend(["", "--- fatal_error.txt asli ---", original_error.read_text(encoding="utf-8", errors="replace")])
+            copied_error.write_text("\n".join(body), encoding="utf-8")
+            item["status"] = "error"
+            item["stage"] = final_result.get("final_stage") or "Gagal"
+            item["detail"] = final_result.get("error") or "Unknown error"
+            item["error_log"] = str(copied_error)
+            downloadable.append(str(copied_error))
+
+        yield (
+            batch_status_md(
+                items,
+                f"Link {item['index']} selesai. Melanjutkan otomatis ke link berikutnya.",
+            ),
+            current_preview,
+            current_roadmap,
+            public_batch_summary(items),
+            downloadable,
+        )
+
+    summary_json, summary_csv = write_batch_reports(batch_root, items)
+    downloadable.extend([str(summary_json), str(summary_csv)])
+    master_zip = make_batch_master_zip(
+        batch_root, [Path(path) for path in downloadable]
+    )
+    downloadable.append(str(master_zip))
+    done = sum(1 for item in items if item["status"] == "done")
+    failed = sum(1 for item in items if item["status"] == "error")
+    yield (
+        batch_status_md(
+            items,
+            f"🎉 Batch selesai: {done} berhasil, {failed} gagal. Master ZIP sudah dibuat.",
+        ),
+        current_preview,
+        "## ✅ Batch selesai\nSemua link sudah diproses secara berurutan.",
+        public_batch_summary(items),
+        downloadable,
+    )
+
+
+with gr.Blocks(title="Clipping Lite Stage 4") as demo:
     gr.Markdown(
         """
-        # 🎬 Clipping Lite — Stage 3
+        # 🎬 Clipping Lite — Stage 4 Queue
 
-        **Drive/Upload → AV1/H.265 Normalizer → Groq Whisper → Scene/Audio/OCR → Gemini Vision → Groq Llama →
-        MediaPipe Face Tracking → Animated Smart Crop → Subtitle → Render**
+        **Single video + Batch antrean link Drive berurutan.**  \n        Pipeline: AV1/H.265 Normalizer → Groq Whisper → Gemini Vision → Groq Llama →
+        MediaPipe → Animated Smart Crop → Subtitle → Render.
         """
     )
     runtime_info = gr.Markdown(config_md())
 
-    with gr.Row():
-        with gr.Column():
-            upload = gr.Video(label="Upload video — opsional")
-            drive = gr.Textbox(
-                label="Link Google Drive publik",
-                placeholder="https://drive.google.com/file/d/FILE_ID/view?usp=sharing",
-                lines=2,
-            )
-            whisper = gr.Dropdown(
-                [
-                    "Groq Whisper (disarankan)",
-                    "Local Whisper tiny",
-                    "Local Whisper base",
-                ],
-                value="Groq Whisper (disarankan)",
-                label="Mesin transkripsi",
-            )
-            with gr.Row():
-                count = gr.Slider(1, 5, value=3, step=1, label="Jumlah clip")
-                duration = gr.Slider(
-                    20, 60, value=30, step=5, label="Durasi target"
+    with gr.Tab("🎞️ Satu Video"):
+        with gr.Row():
+            with gr.Column():
+                upload = gr.Video(label="Upload video — opsional")
+                drive = gr.Textbox(
+                    label="Link Google Drive publik",
+                    placeholder="https://drive.google.com/file/d/FILE_ID/view?usp=sharing",
+                    lines=2,
                 )
-            ocr_box = gr.Checkbox(False, label="Aktifkan OCR (lebih lambat)")
-            button = gr.Button("🚀 Proses Full Otomatis Stage 3", variant="primary")
+                whisper = gr.Dropdown(
+                    [
+                        "Groq Whisper (disarankan)",
+                        "Local Whisper tiny",
+                        "Local Whisper base",
+                    ],
+                    value="Groq Whisper (disarankan)",
+                    label="Mesin transkripsi",
+                )
+                with gr.Row():
+                    count = gr.Slider(1, 5, value=3, step=1, label="Jumlah clip")
+                    duration = gr.Slider(20, 60, value=30, step=5, label="Durasi target")
+                ocr_box = gr.Checkbox(False, label="Aktifkan OCR (lebih lambat)")
+                button = gr.Button("🚀 Proses Satu Video", variant="primary")
 
-        with gr.Column():
-            preview = gr.Video(label="Preview sumber")
-            status = gr.Markdown("Tekan tombol proses untuk mulai.")
+            with gr.Column():
+                preview = gr.Video(label="Preview sumber")
+                status = gr.Markdown("Tekan tombol proses untuk mulai.")
 
-    with gr.Tab("Transkrip"):
-        transcript_out = gr.Textbox(lines=18, interactive=False)
-    with gr.Tab("Clip terpilih"):
-        clips_out = gr.JSON()
-    with gr.Tab("Hasil"):
-        files_out = gr.File(file_count="multiple")
+        with gr.Tab("Transkrip"):
+            transcript_out = gr.Textbox(lines=18, interactive=False)
+        with gr.Tab("Clip terpilih"):
+            clips_out = gr.JSON()
+        with gr.Tab("Hasil"):
+            files_out = gr.File(file_count="multiple")
 
-    button.click(
-        pipeline,
-        [upload, drive, count, duration, whisper, ocr_box],
-        [status, preview, transcript_out, clips_out, files_out],
-        show_progress="full",
-    )
+        button.click(
+            pipeline,
+            [upload, drive, count, duration, whisper, ocr_box],
+            [status, preview, transcript_out, clips_out, files_out],
+            show_progress="full",
+        )
+
+    with gr.Tab("📚 Batch Link Drive"):
+        gr.Markdown(
+            f"""
+            ### Tempel banyak link — satu link per baris
+            Diproses **satu per satu**, bukan bersamaan, supaya CPU Basic stabil.  \n            Maksimal **{MAX_BATCH_LINKS} link per batch**. Biarkan tab tetap terbuka selama proses.
+            """
+        )
+        with gr.Row():
+            with gr.Column():
+                batch_links = gr.Textbox(
+                    label="Daftar link Google Drive publik",
+                    placeholder=(
+                        "https://drive.google.com/file/d/FILE_ID_1/view?usp=sharing\n"
+                        "https://drive.google.com/file/d/FILE_ID_2/view?usp=sharing"
+                    ),
+                    lines=12,
+                )
+                batch_whisper = gr.Dropdown(
+                    [
+                        "Groq Whisper (disarankan)",
+                        "Local Whisper tiny",
+                        "Local Whisper base",
+                    ],
+                    value="Groq Whisper (disarankan)",
+                    label="Mesin transkripsi batch",
+                )
+                with gr.Row():
+                    batch_count = gr.Slider(1, 5, value=3, step=1, label="Clip per video")
+                    batch_duration = gr.Slider(20, 60, value=30, step=5, label="Durasi target")
+                batch_ocr = gr.Checkbox(False, label="Aktifkan OCR untuk semua video")
+                batch_button = gr.Button("🚀 Jalankan Antrian Batch", variant="primary")
+
+            with gr.Column():
+                batch_preview = gr.Video(label="Video yang sedang diproses")
+                batch_current = gr.Markdown("Antrian belum dijalankan.")
+
+        batch_status = gr.Markdown("Masukkan link lalu jalankan batch.")
+        with gr.Tab("Ringkasan Batch"):
+            batch_results = gr.JSON()
+        with gr.Tab("Download Batch"):
+            batch_files = gr.File(file_count="multiple")
+
+        batch_button.click(
+            batch_pipeline,
+            [
+                batch_links,
+                batch_count,
+                batch_duration,
+                batch_whisper,
+                batch_ocr,
+            ],
+            [
+                batch_status,
+                batch_preview,
+                batch_current,
+                batch_results,
+                batch_files,
+            ],
+            show_progress="full",
+        )
 
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=1, max_size=4)
+    demo.queue(default_concurrency_limit=1, max_size=8)
     demo.launch(server_name="0.0.0.0", server_port=7860)
