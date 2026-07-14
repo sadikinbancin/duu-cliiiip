@@ -919,7 +919,26 @@ Aturan:
    campaign_visual_fit dan campaign_visual_risk dari Gemini sebagai bukti visual.
 6. Jangan mengarang kepatuhan. Bila tidak ada kandidat sempurna, pilih yang paling
    mendekati dan tulis kekurangannya pada reason.
+7. Untuk setiap clip terpilih, isi campaign_match_score 0-100, campaign_fit_reason,
+   matched_requirements, violated_requirements, dan posting_notes.
+8. matched_requirements dan violated_requirements hanya untuk aturan isi/edit clip.
+   posting_notes hanya untuk aturan akun/posting yang harus dilakukan pengguna.
 """.strip()
+
+    response_schema = (
+        '{"clips":[{"candidate_id":"C001","score":90,'
+        '"title":"judul singkat","reason":"alasan pemilihan"}]}'
+    )
+    if campaign_requirements:
+        response_schema = (
+            '{"clips":[{"candidate_id":"C001","score":90,'
+            '"title":"judul singkat","reason":"alasan pemilihan",'
+            '"campaign_match_score":94,'
+            '"campaign_fit_reason":"mengapa cocok dengan brief",'
+            '"matched_requirements":["aturan yang terpenuhi"],'
+            '"violated_requirements":["aturan yang dilanggar atau belum pasti"],'
+            '"posting_notes":["aturan akun/posting yang harus dilakukan"]}]}'
+        )
 
     prompt = f"""
 Anda adalah editor video short-form profesional.
@@ -937,7 +956,7 @@ Nilai setiap kandidat dari:
 {campaign_section}
 
 Hindari kandidat yang tumpang tindih. Balas JSON murni dengan format:
-{{"clips":[{{"candidate_id":"C001","score":90,"title":"judul singkat","reason":"alasan pemilihan"}}]}}
+{response_schema}
 
 Kandidat:
 {json.dumps(compact, ensure_ascii=False)}
@@ -990,6 +1009,21 @@ Kandidat:
         )
         candidate["title"] = str(result.get("title") or "Highlight")[:80]
         candidate["reason"] = str(result.get("reason") or "")[:300]
+        if campaign_requirements:
+            try:
+                campaign_match_score = int(float(result.get("campaign_match_score", 50)))
+            except (TypeError, ValueError):
+                campaign_match_score = 50
+            candidate["campaign_match_score"] = int(clamp(campaign_match_score, 0, 100))
+            candidate["campaign_fit_reason"] = str(
+                result.get("campaign_fit_reason")
+                or result.get("reason")
+                or candidate.get("campaign_visual_fit")
+                or ""
+            )[:500]
+            candidate["matched_requirements"] = result.get("matched_requirements") or []
+            candidate["violated_requirements"] = result.get("violated_requirements") or []
+            candidate["posting_notes"] = result.get("posting_notes") or []
         ranked.append(candidate)
 
     ranked = non_overlap(ranked, count)
@@ -1003,9 +1037,46 @@ Kandidat:
     return ranked[:count], f"Groq Llama ({cfg['groq_llm_model']})", True
 
 
-def write_clips(selected: list[dict], job: Path):
+def write_clips(selected: list[dict], job: Path, campaign_requirements: str = ""):
+    campaign_requirements = (campaign_requirements or "").strip()
+    campaign_mode = bool(campaign_requirements)
     clips = []
+
     for index, item in enumerate(selected, 1):
+        def as_list(value):
+            if value is None:
+                return []
+            if isinstance(value, list):
+                return [str(entry)[:240] for entry in value if str(entry).strip()][:12]
+            return [str(value)[:240]] if str(value).strip() else []
+
+        campaign_match_score = None
+        campaign_fit_reason = ""
+        matched_requirements = []
+        violated_requirements = []
+        posting_notes = []
+
+        if campaign_mode:
+            try:
+                campaign_match_score = int(
+                    clamp(int(float(item.get("campaign_match_score", 50))), 0, 100)
+                )
+            except (TypeError, ValueError):
+                campaign_match_score = 50
+            campaign_fit_reason = str(
+                item.get("campaign_fit_reason")
+                or item.get("reason")
+                or item.get("campaign_visual_fit")
+                or "Kecocokan dinilai dari transkrip dan bukti visual."
+            )[:500]
+            matched_requirements = as_list(item.get("matched_requirements"))
+            violated_requirements = as_list(item.get("violated_requirements"))
+            posting_notes = as_list(item.get("posting_notes"))
+            if not matched_requirements and item.get("campaign_visual_fit"):
+                matched_requirements = as_list(item.get("campaign_visual_fit"))
+            if not violated_requirements and item.get("campaign_visual_risk"):
+                violated_requirements = as_list(item.get("campaign_visual_risk"))
+
         clips.append(
             {
                 "id": f"{index:02d}",
@@ -1019,12 +1090,45 @@ def write_clips(selected: list[dict], job: Path):
                 "hook_visual": item.get("hook_visual", ""),
                 "visual_summary": item.get("visual_summary", ""),
                 "visual_risk": item.get("visual_risk", ""),
+                "campaign_match_score": campaign_match_score,
+                "campaign_fit_reason": campaign_fit_reason,
+                "matched_requirements": matched_requirements,
+                "violated_requirements": violated_requirements,
+                "posting_notes": posting_notes,
+                "campaign_visual_fit": item.get("campaign_visual_fit", ""),
+                "campaign_visual_risk": item.get("campaign_visual_risk", ""),
             }
         )
-    payload = {"clips": clips}
+
+    payload = {
+        "campaign_mode": campaign_mode,
+        "campaign_requirements": campaign_requirements or None,
+        "clips": clips,
+    }
     path = job / "clips.json"
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (job / "campaign_evaluation.json").write_text(
+        json.dumps(
+            {
+                "campaign_mode": campaign_mode,
+                "campaign_requirements": campaign_requirements or None,
+                "clips": [
+                    {
+                        "id": clip["id"],
+                        "title": clip["title"],
+                        "campaign_match_score": clip["campaign_match_score"],
+                        "campaign_fit_reason": clip["campaign_fit_reason"],
+                        "matched_requirements": clip["matched_requirements"],
+                        "violated_requirements": clip["violated_requirements"],
+                        "posting_notes": clip["posting_notes"],
+                    }
+                    for clip in clips
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     return path, payload
 
@@ -1553,7 +1657,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             selected = non_overlap(candidates, int(clip_count))
             score_engine = f"heuristic fallback ({exc})"
             states[current] = "warning"
-        clips_path, clips = write_clips(selected, job)
+        clips_path, clips = write_clips(selected, job, campaign_requirements)
         clips_view = clips
         yield snap(f"{len(clips['clips'])} clip dipilih: {score_engine}")
 
@@ -1612,6 +1716,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
             job / "gemini_vision_error.txt",
             job / "gemini_vision.json",
             job / "clips.json",
+            job / "campaign_evaluation.json",
             job / "face_data.json",
             job / "crop_data.json",
             job / "groq_scoring_request.json",
