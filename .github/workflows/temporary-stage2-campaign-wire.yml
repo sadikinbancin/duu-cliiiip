@@ -1,0 +1,130 @@
+name: Temporary Stage 2 Campaign Wiring
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/temporary-stage2-campaign-wire.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-stage2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wire Campaign Requirements into pipeline
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+
+          path = Path('app.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_signature = 'def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_ocr):'
+          new_signature = 'def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_ocr, campaign_requirements=""):'
+          if text.count(old_signature) != 1:
+              raise SystemExit(f'Expected exactly one old pipeline signature, found {text.count(old_signature)}')
+          text = text.replace(old_signature, new_signature, 1)
+
+          old_job = '''    job = ROOT / uuid.uuid4().hex
+              job.mkdir(parents=True, exist_ok=True)
+          '''
+          # Build without relying on accidental indentation in this workflow file.
+          old_job = '    job = ROOT / uuid.uuid4().hex\n    job.mkdir(parents=True, exist_ok=True)\n'
+          new_job = '''    job = ROOT / uuid.uuid4().hex
+              job.mkdir(parents=True, exist_ok=True)
+          '''
+          new_job = (
+              '    job = ROOT / uuid.uuid4().hex\n'
+              '    job.mkdir(parents=True, exist_ok=True)\n\n'
+              '    campaign_requirements = (campaign_requirements or "").strip()\n'
+              '    campaign_path = job / "campaign_requirements.txt"\n'
+              '    if campaign_requirements:\n'
+              '        campaign_path.write_text(campaign_requirements, encoding="utf-8")\n'
+          )
+          if text.count(old_job) != 1:
+              raise SystemExit(f'Expected exactly one job initialization block, found {text.count(old_job)}')
+          text = text.replace(old_job, new_job, 1)
+
+          old_debug = '''        debug_files = [
+              job / "runtime_config.json",
+          '''
+          old_debug = '        debug_files = [\n            job / "runtime_config.json",\n'
+          new_debug = '        debug_files = [\n            job / "runtime_config.json",\n            job / "campaign_requirements.txt",\n'
+          if text.count(old_debug) != 1:
+              raise SystemExit(f'Expected exactly one debug_files anchor, found {text.count(old_debug)}')
+          text = text.replace(old_debug, new_debug, 1)
+
+          old_inputs = '            [upload, drive, count, duration, whisper, ocr_box],'
+          new_inputs = '            [upload, drive, count, duration, whisper, ocr_box, campaign_requirements],'
+          if text.count(old_inputs) != 1:
+              raise SystemExit(f'Expected exactly one single-video input list, found {text.count(old_inputs)}')
+          text = text.replace(old_inputs, new_inputs, 1)
+
+          # Rapikan hanya blok UI yang sebelumnya sudah ditambahkan manual.
+          start_marker = '                campaign_requirements = gr.Textbox('
+          end_marker = '                whisper = gr.Dropdown('
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start == -1 or end == -1:
+              raise SystemExit('Campaign UI block or Whisper anchor not found')
+          clean_block = '''                campaign_requirements = gr.Textbox(
+              label="📋 Campaign Requirements — opsional",
+              placeholder=(
+                  "Tempel persyaratan kampanye di sini.\\n\\n"
+                  "Contoh:\\n"
+                  "- Speaker harus berbicara di setiap clip\\n"
+                  "- Hook kuat pada 1–3 detik pertama\\n"
+                  "- Bukan pure lifestyle\\n"
+                  "- Edit clean, modern, dan tajam\\n\\n"
+                  "Kosongkan untuk mode viral biasa."
+              ),
+              lines=9,
+          )
+          '''
+          # Restore the intended 16/20-space indentation exactly.
+          clean_block = clean_block.replace('\n              ', '\n                    ').replace('\n          )', '\n                )')
+          text = text[:start] + clean_block + text[end:]
+
+          ast.parse(text)
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          python -m py_compile app.py
+
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('app.py').read_text(encoding='utf-8')
+          checks = {
+              'pipeline accepts campaign_requirements': 'enable_ocr, campaign_requirements=""):' in text,
+              'campaign saved to job': 'campaign_requirements.txt' in text,
+              'button sends campaign textbox': '[upload, drive, count, duration, whisper, ocr_box, campaign_requirements]' in text,
+              'Gemini call unchanged': 'gemini_vision_score(\n                video, candidates, job\n            )' in text,
+              'Groq call unchanged': 'groq_rank(\n                candidates, int(clip_count), job\n            )' in text,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          if failed:
+              raise SystemExit('Validation failed: ' + ', '.join(failed))
+          print('Stage 2 validation passed.')
+          PY
+
+      - name: Commit Stage 2
+        shell: bash
+        run: |
+          if git diff --quiet -- app.py; then
+            echo 'No app.py changes required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          git commit -m 'Connect Campaign Requirements textbox to pipeline'
+          git push
