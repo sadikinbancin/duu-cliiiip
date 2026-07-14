@@ -1208,6 +1208,8 @@ def mediapipe_crop(video: Path, clips_path: Path, job: Path):
                 str(crop_path),
                 "--source",
                 str(video),
+                "--scenes",
+                str(job / "scenes.json"),
             ],
             cwd="/app",
             timeout=600,
@@ -1358,6 +1360,76 @@ def smooth_commands(
     return int(round(float(dense_xs[0])))
 
 
+# STAGE43_DIRECTOR_MODE
+def fallback_intervals_of(crop_item: dict, duration: float) -> list[tuple[float, float]]:
+    intervals = []
+    for item in crop_item.get("fallback_intervals", []) or []:
+        if isinstance(item, dict):
+            start = float(item.get("start", 0.0))
+            end = float(item.get("end", start))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            start = float(item[0])
+            end = float(item[1])
+        else:
+            continue
+        start = max(0.0, min(duration, start))
+        end = max(start, min(duration, end))
+        if end - start >= 0.05:
+            intervals.append((start, end))
+
+    merged = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1] + 0.05:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(float(start), float(end)) for start, end in merged]
+
+
+def blur_full_frame_complex(ass_path: Path | None = None) -> str:
+    chain = (
+        "[0:v]setpts=PTS-STARTPTS,split=2[bg_in][fg_in];"
+        "[bg_in]scale=720:1280:force_original_aspect_ratio=increase,"
+        "crop=720:1280,gblur=sigma=24[bg];"
+        "[fg_in]scale=720:1280:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[mixed]"
+    )
+    if ass_path and ass_path.is_file():
+        chain += f";[mixed]ass='{filter_path(ass_path)}'[vout]"
+    else:
+        chain += ";[mixed]null[vout]"
+    return chain
+
+
+def director_filter_complex(
+    crop_w: int,
+    crop_h: int,
+    initial_x: int,
+    command_path: Path,
+    intervals: list[tuple[float, float]],
+    ass_path: Path | None,
+) -> str:
+    enable_expr = "+".join(
+        f"between(t,{start:.3f},{end:.3f})" for start, end in intervals
+    )
+    chain = (
+        "[0:v]setpts=PTS-STARTPTS,split=3[focus_in][bg_in][fg_in];"
+        f"[focus_in]sendcmd=f='{filter_path(command_path)}',"
+        f"crop@track={crop_w}:{crop_h}:{initial_x}:0,"
+        "scale=720:1280[focus];"
+        "[bg_in]scale=720:1280:force_original_aspect_ratio=increase,"
+        "crop=720:1280,gblur=sigma=24[bg];"
+        "[fg_in]scale=720:1280:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[full];"
+        f"[focus][full]overlay=0:0:enable='{enable_expr}'[mixed]"
+    )
+    if ass_path and ass_path.is_file():
+        chain += f";[mixed]ass='{filter_path(ass_path)}'[vout]"
+    else:
+        chain += ";[mixed]null[vout]"
+    return chain
+
+
 def render_all(
     video: Path,
     meta: dict,
@@ -1390,27 +1462,11 @@ def render_all(
         crop_h = int(crop_item.get("crop_h") or default_h)
         crop_w = min(crop_w, meta["width"])
         crop_h = min(crop_h, meta["height"])
-        center_x = max(0, (meta["width"] - crop_w) // 2)
 
         command_path = job / f"crop_commands_{clip['id']}.txt"
         initial_x = smooth_commands(clip, crop_item, command_path)
         animated = initial_x is not None and command_path.is_file()
-
-        if animated:
-            filter_chain = (
-                "setpts=PTS-STARTPTS,"
-                f"sendcmd=f={filter_path(command_path)},"
-                f"crop@track={crop_w}:{crop_h}:{initial_x}:0,"
-                "scale=720:1280"
-            )
-        else:
-            filter_chain = (
-                f"setpts=PTS-STARTPTS,crop={crop_w}:{crop_h}:{center_x}:0,"
-                "scale=720:1280"
-            )
-
-        if ass_path.is_file():
-            filter_chain += f",ass='{filter_path(ass_path)}'"
+        intervals = fallback_intervals_of(crop_item, float(clip["duration"]))
 
         command = [
             "ffmpeg",
@@ -1423,24 +1479,65 @@ def render_all(
             str(video),
             "-t",
             str(clip["duration"]),
-            "-vf",
-            filter_chain,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "21",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            str(output),
         ]
+
+        uses_complex = False
+        if animated and intervals:
+            uses_complex = True
+            filter_value = director_filter_complex(
+                crop_w,
+                crop_h,
+                int(initial_x),
+                command_path,
+                intervals,
+                ass_path,
+            )
+        elif animated:
+            filter_value = (
+                "setpts=PTS-STARTPTS,"
+                f"sendcmd=f='{filter_path(command_path)}',"
+                f"crop@track={crop_w}:{crop_h}:{initial_x}:0,"
+                "scale=720:1280"
+            )
+            if ass_path.is_file():
+                filter_value += f",ass='{filter_path(ass_path)}'"
+        else:
+            uses_complex = True
+            filter_value = blur_full_frame_complex(ass_path)
+
+        if uses_complex:
+            command.extend(
+                [
+                    "-filter_complex",
+                    filter_value,
+                    "-map",
+                    "[vout]",
+                    "-map",
+                    "0:a?",
+                ]
+            )
+        else:
+            command.extend(["-vf", filter_value])
+
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "21",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ]
+        )
 
         try:
             run(command, timeout=1800)
@@ -1449,48 +1546,43 @@ def render_all(
             else:
                 fallback_count += 1
         except Exception as exc:
-            # Keep the pipeline alive if animated crop syntax fails on a specific FFmpeg build.
-            (job / f"render_animated_error_{clip['id']}.txt").write_text(
+            (job / f"render_director_error_{clip['id']}.txt").write_text(
                 f"{type(exc).__name__}: {exc}", encoding="utf-8"
             )
-            fallback_filter = (
-                f"setpts=PTS-STARTPTS,crop={crop_w}:{crop_h}:{center_x}:0,"
-                "scale=720:1280"
-            )
-            if ass_path.is_file():
-                fallback_filter += f",ass='{filter_path(ass_path)}'"
-            run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-v",
-                    "error",
-                    "-ss",
-                    str(clip["start"]),
-                    "-i",
-                    str(video),
-                    "-t",
-                    str(clip["duration"]),
-                    "-vf",
-                    fallback_filter,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "21",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    "-movflags",
-                    "+faststart",
-                    str(output),
-                ],
-                timeout=1800,
-            )
+            fallback_command = [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-ss",
+                str(clip["start"]),
+                "-i",
+                str(video),
+                "-t",
+                str(clip["duration"]),
+                "-filter_complex",
+                blur_full_frame_complex(ass_path),
+                "-map",
+                "[vout]",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "21",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ]
+            run(fallback_command, timeout=1800)
             fallback_count += 1
 
         if output.is_file() and output.stat().st_size > 0:
@@ -1675,7 +1767,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         yield snap(
             face_note
             if smart_crop_ok
-            else f"{face_note} | Render akan memakai center crop."
+            else f"{face_note} | Render akan memakai full-frame blur fallback."
         )
 
         current = STAGES[10]
@@ -1687,7 +1779,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
 
         current = STAGES[11]
         states[current] = "running"
-        yield snap("FFmpeg merender smart crop bergerak 720×1280...")
+        yield snap("FFmpeg merender Director Mode 720×1280...")
         rendered, animated_count, fallback_count = render_all(
             video, meta, clips, crop_path, captions, job
         )
@@ -1695,7 +1787,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         states[current] = "done" if fallback_count == 0 else "warning"
         yield snap(
             f"{len(rendered)} clip selesai: {animated_count} animated crop, "
-            f"{fallback_count} center-crop fallback."
+            f"{fallback_count} blur fallback penuh."
         )
 
         current = STAGES[12]
@@ -1729,10 +1821,11 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         debug_files.extend((job / "gemini_vision_frames").glob("*.jpg"))
         debug_files.extend(job.glob("crop_commands_*.txt"))
         debug_files.extend(job.glob("render_animated_error_*.txt"))
+        debug_files.extend(job.glob("render_director_error_*.txt"))
         archive = make_zip(job, rendered + debug_files)
         files.append(str(archive))
         states[current] = "done"
-        yield snap("🎉 Tahap 4 selesai: campaign match score, requirement results, dan pipeline clipping aktif.")
+        yield snap("🎬 Stage 4.3 selesai: Director Mode, speaker lock, scene reset, dan blur fallback aktif.")
         return {
             "ok": True,
             "job": str(job),
