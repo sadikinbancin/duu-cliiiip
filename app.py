@@ -1732,7 +1732,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         archive = make_zip(job, rendered + debug_files)
         files.append(str(archive))
         states[current] = "done"
-        yield snap("🎉 Tahap 3 selesai: Gemini Vision + Groq scoring + MediaPipe + animated smart crop aktif.")
+        yield snap("🎉 Tahap 4 selesai: campaign match score, requirement results, dan pipeline clipping aktif.")
         return {
             "ok": True,
             "job": str(job),
