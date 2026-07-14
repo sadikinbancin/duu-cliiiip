@@ -1878,18 +1878,18 @@ with gr.Blocks(title="Clipping Lite Stage 4") as demo:
                     lines=2,
                 )
                 campaign_requirements = gr.Textbox(
-    label="📋 Campaign Requirements — opsional",
-    placeholder=(
-        "Tempel persyaratan kampanye di sini.\n\n"
-        "Contoh:\n"
-        "- Speaker harus berbicara di setiap clip\n"
-        "- Hook kuat pada 1–3 detik pertama\n"
-        "- Bukan pure lifestyle\n"
-        "- Edit clean, modern, dan tajam\n\n"
-        "Kosongkan untuk mode viral biasa."
-    ),
-    lines=9,
-)
+                    label="📋 Campaign Requirements — opsional",
+                    placeholder=(
+                        "Tempel persyaratan kampanye di sini.\n\n"
+                        "Contoh:\n"
+                        "- Speaker harus berbicara di setiap clip\n"
+                        "- Hook kuat pada 1–3 detik pertama\n"
+                        "- Bukan pure lifestyle\n"
+                        "- Edit clean, modern, dan tajam\n\n"
+                        "Kosongkan untuk mode viral biasa."
+                    ),
+                    lines=9,
+                )
                 whisper = gr.Dropdown(
                     [
                         "Groq Whisper (disarankan)",
