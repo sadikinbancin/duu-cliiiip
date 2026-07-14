@@ -12,6 +12,8 @@ RUN apt-get update \
        tesseract-ocr-eng \
        libglib2.0-0 \
        libgl1 \
+       libgles2 \
+       libegl1 \
        libgomp1 \
        fonts-dejavu-core \
        ca-certificates \
