@@ -1,0 +1,43 @@
+name: Apply Stage 4.3 Director Mode
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/apply_stage43.py
+      - .github/workflows/stage43-director-mode.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply Stage 4.3 patch
+        run: python scripts/apply_stage43.py
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile app.py
+          python -m py_compile scripts/face_track.py
+          python -m py_compile scripts/smart_crop.py
+
+      - name: Commit patched app
+        run: |
+          if git diff --quiet; then
+            echo "No changes required."
+            exit 0
+          fi
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add app.py
+          git commit -m "Add Stage 4.3 Director Mode render pipeline"
+          git push origin main
