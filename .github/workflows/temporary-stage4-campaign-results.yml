@@ -1,0 +1,42 @@
+name: Temporary Stage 4 Campaign Results
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/temporary-stage4-campaign-results.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-stage4:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply Stage 4 patch
+        shell: bash
+        run: |
+          python scripts/temporary_stage4_patch.py
+          python -m py_compile app.py
+          grep -F 'campaign_match_score' app.py
+          grep -F 'matched_requirements' app.py
+          grep -F 'violated_requirements' app.py
+          grep -F 'campaign_evaluation.json' app.py
+
+      - name: Commit Stage 4
+        shell: bash
+        run: |
+          if git diff --quiet -- app.py; then
+            echo 'No Stage 4 changes required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py
+          git commit -m 'Add campaign match scoring and requirement results'
+          git push
