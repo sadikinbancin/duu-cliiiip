@@ -1,0 +1,91 @@
+name: Temporary Stage 3 Campaign Prompts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/temporary-stage3-campaign-prompts.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-stage3:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch campaign-aware Gemini and Groq prompts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+
+          path = Path("app.py")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected 1 match, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once('def gemini_vision_score(video: Path, candidates: list[dict], job: Path):', 'def gemini_vision_score(video: Path, candidates: list[dict], job: Path, campaign_requirements: str = ""):', 'Gemini signature')
+
+          replace_once('    if not key:\n        return candidates, "Gemini Vision dilewati: GOOGLE_API_KEY belum dipasang.", False\n\n    # Keep it cheap and fast: analyze only the top candidates from heuristic pre-score.', '    if not key:\n        return candidates, "Gemini Vision dilewati: GOOGLE_API_KEY belum dipasang.", False\n\n    campaign_requirements = (campaign_requirements or "").strip()\n\n    # Keep it cheap and fast: analyze only the top candidates from heuristic pre-score.', 'Gemini campaign normalization')
+
+          replace_once('    image_dir = job / "gemini_vision_frames"\n    parts = [\n        {\n            "text": (\n                "Anda adalah editor short-form video. Nilai kualitas visual setiap kandidat "\n                "berdasarkan hook visual, wajah/ekspresi, gerakan, framing, kejernihan, "\n                "dan apakah cocok jadi short viral. Balas JSON murni saja dengan format: "\n                "{\\"items\\":[{\\"candidate_id\\":\\"C001\\",\\"visual_score\\":80,"\n                "\\"hook_visual\\":\\"...\\",\\"visual_summary\\":\\"...\\","\n                "\\"risk\\":\\"...\\"}]}"\n            )\n        }\n    ]\n    request_meta = {"model": cfg["gemini_vision_model"], "items": []}', '    image_dir = job / "gemini_vision_frames"\n    instruction = (\n        "Anda adalah editor short-form video. Nilai kualitas visual setiap kandidat "\n        "berdasarkan hook visual, wajah/ekspresi, gerakan, framing, kejernihan, "\n        "dan apakah cocok jadi short viral. Balas JSON murni saja dengan format: "\n        "{\\"items\\":[{\\"candidate_id\\":\\"C001\\",\\"visual_score\\":80,"\n        "\\"hook_visual\\":\\"...\\",\\"visual_summary\\":\\"...\\","\n        "\\"risk\\":\\"...\\",\\"campaign_visual_fit\\":\\"\\","\n        "\\"campaign_visual_risk\\":\\"\\"}]}"\n    )\n    if campaign_requirements:\n        instruction += (\n            "\\n\\nMODE KAMPANYE AKTIF.\\n"\n            "PERSYARATAN KAMPANYE:\\n"\n            f"{campaign_requirements[:12000]}\\n\\n"\n            "Nilai hanya persyaratan yang dapat diverifikasi dari frame, seperti subjek "\n            "utama terlihat, talking-head versus pure lifestyle, framing, kualitas visual, "\n            "dan gaya edit. Jangan menganggap aturan akun/posting seperti bio, username, "\n            "tag, link, negara audiens, follow, pembayaran, atau larangan bot sebagai "\n            "kegagalan visual clip. Isi campaign_visual_fit dengan kecocokan yang terlihat "\n            "dan campaign_visual_risk dengan pelanggaran atau hal yang belum pasti. "\n            "Jangan mengarang fakta yang tidak terlihat."\n        )\n    parts = [{"text": instruction}]\n    request_meta = {\n        "model": cfg["gemini_vision_model"],\n        "campaign_mode": bool(campaign_requirements),\n        "campaign_requirements": campaign_requirements or None,\n        "items": [],\n    }', 'Gemini prompt')
+
+          replace_once('            "visual_risk": str(item.get("risk") or "")[:250],\n        }', '            "visual_risk": str(item.get("risk") or "")[:250],\n            "campaign_visual_fit": str(item.get("campaign_visual_fit") or "")[:400],\n            "campaign_visual_risk": str(item.get("campaign_visual_risk") or "")[:400],\n        }', 'Gemini parsed campaign fields')
+
+          replace_once('            new_item.setdefault("visual_risk", "")\n        enriched.append(new_item)', '            new_item.setdefault("visual_risk", "")\n            new_item.setdefault("campaign_visual_fit", "")\n            new_item.setdefault("campaign_visual_risk", "")\n        enriched.append(new_item)', 'Gemini campaign defaults')
+
+          replace_once('def groq_rank(candidates: list[dict], count: int, job: Path):', 'def groq_rank(candidates: list[dict], count: int, job: Path, campaign_requirements: str = ""):', 'Groq signature')
+
+          replace_once('    if not key:\n        return non_overlap(candidates, count), "heuristic tanpa GROQ_API_KEY", False\n\n    from groq import Groq', '    if not key:\n        return non_overlap(candidates, count), "heuristic tanpa GROQ_API_KEY", False\n\n    campaign_requirements = (campaign_requirements or "").strip()\n\n    from groq import Groq', 'Groq campaign normalization')
+
+          replace_once('            "visual_risk": item.get("visual_risk", ""),\n        }', '            "visual_risk": item.get("visual_risk", ""),\n            "campaign_visual_fit": item.get("campaign_visual_fit", ""),\n            "campaign_visual_risk": item.get("campaign_visual_risk", ""),\n        }', 'Groq compact campaign signals')
+
+          replace_once('    prompt = f"""\nAnda adalah editor video short-form profesional.', '    campaign_section = ""\n    if campaign_requirements:\n        campaign_section = f"""\nMODE KAMPANYE AKTIF.\n\nPERSYARATAN KAMPANYE:\n{campaign_requirements[:12000]}\n\nAturan:\n1. Bedakan persyaratan isi/edit clip dari aturan akun atau posting.\n2. Terapkan aturan isi/edit yang dapat dinilai dari transkrip, waktu, dan sinyal visual.\n3. Bio, username, tag, link, negara audiens, follow, pembayaran, dan larangan bot\n   adalah aturan posting; jangan jadikan itu alasan menolak kandidat clip.\n4. Persyaratan keras isi clip lebih penting daripada potensi viral. Di antara kandidat\n   yang memenuhi brief, pilih yang paling viral.\n5. Gunakan transkrip untuk menilai apakah subjek benar-benar berbicara, serta gunakan\n   campaign_visual_fit dan campaign_visual_risk dari Gemini sebagai bukti visual.\n6. Jangan mengarang kepatuhan. Bila tidak ada kandidat sempurna, pilih yang paling\n   mendekati dan tulis kekurangannya pada reason.\n""".strip()\n\n    prompt = f"""\nAnda adalah editor video short-form profesional.', 'Groq campaign section')
+
+          replace_once('7. Gemini Vision visual_score, hook_visual, visual_summary, dan visual_risk sebagai sinyal visual.\n\nHindari kandidat yang tumpang tindih.', '7. Gemini Vision visual_score, hook_visual, visual_summary, dan visual_risk sebagai sinyal visual.\n\n{campaign_section}\n\nHindari kandidat yang tumpang tindih.', 'Groq prompt injection')
+
+          replace_once('    (job / "groq_scoring_request.json").write_text(\n        json.dumps({"model": cfg["groq_llm_model"], "candidates": compact}, ensure_ascii=False, indent=2),\n        encoding="utf-8",\n    )', '    (job / "groq_scoring_request.json").write_text(\n        json.dumps(\n            {\n                "model": cfg["groq_llm_model"],\n                "campaign_mode": bool(campaign_requirements),\n                "campaign_requirements": campaign_requirements or None,\n                "candidates": compact,\n            },\n            ensure_ascii=False,\n            indent=2,\n        ),\n        encoding="utf-8",\n    )', 'Groq request metadata')
+
+          replace_once('            candidates, vision_note, used_gemini_vision = gemini_vision_score(\n                video, candidates, job\n            )', '            candidates, vision_note, used_gemini_vision = gemini_vision_score(\n                video, candidates, job, campaign_requirements\n            )', 'Pipeline Gemini call')
+
+          replace_once('            selected, score_engine, used_groq_llm = groq_rank(\n                candidates, int(clip_count), job\n            )', '            selected, score_engine, used_groq_llm = groq_rank(\n                candidates, int(clip_count), job, campaign_requirements\n            )', 'Pipeline Groq call')
+
+          ast.parse(text)
+
+          required = [
+              "MODE KAMPANYE AKTIF.",
+              '"campaign_visual_fit"',
+              '"campaign_visual_risk"',
+              '"campaign_mode": bool(campaign_requirements)',
+              "video, candidates, job, campaign_requirements",
+              "candidates, int(clip_count), job, campaign_requirements",
+          ]
+          missing = [item for item in required if item not in text]
+          if missing:
+              raise SystemExit(f"Stage 3 validation failed: {missing}")
+
+          path.write_text(text, encoding="utf-8")
+          PY
+          python -m py_compile app.py
+
+      - name: Commit Stage 3
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          if git diff --cached --quiet; then
+            echo "No app.py changes required."
+            exit 0
+          fi
+          git commit -m "Make Gemini and Groq understand campaign requirements"
+          git push
