@@ -726,12 +726,14 @@ def make_candidate_sheet(video: Path, candidate: dict, output: Path) -> Path:
     return output
 
 
-def gemini_vision_score(video: Path, candidates: list[dict], job: Path):
+def gemini_vision_score(video: Path, candidates: list[dict], job: Path, campaign_requirements: str = ""):
     """Use Google Gemini Vision to score visual hook/clarity for candidates."""
     cfg = env_config()
     key = os.getenv("GOOGLE_API_KEY", "").strip()
     if not key:
         return candidates, "Gemini Vision dilewati: GOOGLE_API_KEY belum dipasang.", False
+
+    campaign_requirements = (campaign_requirements or "").strip()
 
     # Keep it cheap and fast: analyze only the top candidates from heuristic pre-score.
     selected = candidates[: min(10, len(candidates))]
@@ -739,19 +741,35 @@ def gemini_vision_score(video: Path, candidates: list[dict], job: Path):
         return candidates, "Gemini Vision dilewati: tidak ada kandidat.", False
 
     image_dir = job / "gemini_vision_frames"
-    parts = [
-        {
-            "text": (
-                "Anda adalah editor short-form video. Nilai kualitas visual setiap kandidat "
-                "berdasarkan hook visual, wajah/ekspresi, gerakan, framing, kejernihan, "
-                "dan apakah cocok jadi short viral. Balas JSON murni saja dengan format: "
-                "{\"items\":[{\"candidate_id\":\"C001\",\"visual_score\":80,"
-                "\"hook_visual\":\"...\",\"visual_summary\":\"...\","
-                "\"risk\":\"...\"}]}"
-            )
-        }
-    ]
-    request_meta = {"model": cfg["gemini_vision_model"], "items": []}
+    instruction = (
+        "Anda adalah editor short-form video. Nilai kualitas visual setiap kandidat "
+        "berdasarkan hook visual, wajah/ekspresi, gerakan, framing, kejernihan, "
+        "dan apakah cocok jadi short viral. Balas JSON murni saja dengan format: "
+        "{\"items\":[{\"candidate_id\":\"C001\",\"visual_score\":80,"
+        "\"hook_visual\":\"...\",\"visual_summary\":\"...\","
+        "\"risk\":\"...\",\"campaign_visual_fit\":\"\","
+        "\"campaign_visual_risk\":\"\"}]}"
+    )
+    if campaign_requirements:
+        instruction += (
+            "\n\nMODE KAMPANYE AKTIF.\n"
+            "PERSYARATAN KAMPANYE:\n"
+            f"{campaign_requirements[:12000]}\n\n"
+            "Nilai hanya persyaratan yang dapat diverifikasi dari frame, seperti subjek "
+            "utama terlihat, talking-head versus pure lifestyle, framing, kualitas visual, "
+            "dan gaya edit. Jangan menganggap aturan akun/posting seperti bio, username, "
+            "tag, link, negara audiens, follow, pembayaran, atau larangan bot sebagai "
+            "kegagalan visual clip. Isi campaign_visual_fit dengan kecocokan yang terlihat "
+            "dan campaign_visual_risk dengan pelanggaran atau hal yang belum pasti. "
+            "Jangan mengarang fakta yang tidak terlihat."
+        )
+    parts = [{"text": instruction}]
+    request_meta = {
+        "model": cfg["gemini_vision_model"],
+        "campaign_mode": bool(campaign_requirements),
+        "campaign_requirements": campaign_requirements or None,
+        "items": [],
+    }
 
     import base64
 
@@ -821,6 +839,8 @@ def gemini_vision_score(video: Path, candidates: list[dict], job: Path):
             "hook_visual": str(item.get("hook_visual") or "")[:250],
             "visual_summary": str(item.get("visual_summary") or "")[:400],
             "visual_risk": str(item.get("risk") or "")[:250],
+            "campaign_visual_fit": str(item.get("campaign_visual_fit") or "")[:400],
+            "campaign_visual_risk": str(item.get("campaign_visual_risk") or "")[:400],
         }
 
     enriched = []
@@ -840,6 +860,8 @@ def gemini_vision_score(video: Path, candidates: list[dict], job: Path):
             new_item.setdefault("hook_visual", "")
             new_item.setdefault("visual_summary", "")
             new_item.setdefault("visual_risk", "")
+            new_item.setdefault("campaign_visual_fit", "")
+            new_item.setdefault("campaign_visual_risk", "")
         enriched.append(new_item)
 
     enriched.sort(key=lambda item: item.get("preliminary_score", 0), reverse=True)
@@ -849,11 +871,13 @@ def gemini_vision_score(video: Path, candidates: list[dict], job: Path):
     return enriched, f"Gemini Vision aktif: {len(visual_map)}/{len(selected)} kandidat dianalisis.", True
 
 
-def groq_rank(candidates: list[dict], count: int, job: Path):
+def groq_rank(candidates: list[dict], count: int, job: Path, campaign_requirements: str = ""):
     cfg = env_config()
     key = os.getenv("GROQ_API_KEY", "").strip()
     if not key:
         return non_overlap(candidates, count), "heuristic tanpa GROQ_API_KEY", False
+
+    campaign_requirements = (campaign_requirements or "").strip()
 
     from groq import Groq
 
@@ -870,9 +894,32 @@ def groq_rank(candidates: list[dict], count: int, job: Path):
             "hook_visual": item.get("hook_visual", ""),
             "visual_summary": item.get("visual_summary", ""),
             "visual_risk": item.get("visual_risk", ""),
+            "campaign_visual_fit": item.get("campaign_visual_fit", ""),
+            "campaign_visual_risk": item.get("campaign_visual_risk", ""),
         }
         for item in candidates
     ]
+
+    campaign_section = ""
+    if campaign_requirements:
+        campaign_section = f"""
+MODE KAMPANYE AKTIF.
+
+PERSYARATAN KAMPANYE:
+{campaign_requirements[:12000]}
+
+Aturan:
+1. Bedakan persyaratan isi/edit clip dari aturan akun atau posting.
+2. Terapkan aturan isi/edit yang dapat dinilai dari transkrip, waktu, dan sinyal visual.
+3. Bio, username, tag, link, negara audiens, follow, pembayaran, dan larangan bot
+   adalah aturan posting; jangan jadikan itu alasan menolak kandidat clip.
+4. Persyaratan keras isi clip lebih penting daripada potensi viral. Di antara kandidat
+   yang memenuhi brief, pilih yang paling viral.
+5. Gunakan transkrip untuk menilai apakah subjek benar-benar berbicara, serta gunakan
+   campaign_visual_fit dan campaign_visual_risk dari Gemini sebagai bukti visual.
+6. Jangan mengarang kepatuhan. Bila tidak ada kandidat sempurna, pilih yang paling
+   mendekati dan tulis kekurangannya pada reason.
+""".strip()
 
     prompt = f"""
 Anda adalah editor video short-form profesional.
@@ -887,6 +934,8 @@ Nilai setiap kandidat dari:
 6. Scene change, energi audio, dan OCR sebagai sinyal pendukung.
 7. Gemini Vision visual_score, hook_visual, visual_summary, dan visual_risk sebagai sinyal visual.
 
+{campaign_section}
+
 Hindari kandidat yang tumpang tindih. Balas JSON murni dengan format:
 {{"clips":[{{"candidate_id":"C001","score":90,"title":"judul singkat","reason":"alasan pemilihan"}}]}}
 
@@ -895,7 +944,16 @@ Kandidat:
 """.strip()
 
     (job / "groq_scoring_request.json").write_text(
-        json.dumps({"model": cfg["groq_llm_model"], "candidates": compact}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "model": cfg["groq_llm_model"],
+                "campaign_mode": bool(campaign_requirements),
+                "campaign_requirements": campaign_requirements or None,
+                "candidates": compact,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -1475,7 +1533,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         )
         try:
             candidates, vision_note, used_gemini_vision = gemini_vision_score(
-                video, candidates, job
+                video, candidates, job, campaign_requirements
             )
             states[current] = "done" if used_gemini_vision else "warning"
         except Exception as exc:
@@ -1488,7 +1546,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         yield snap(f"Menilai kandidat dengan {cfg['groq_llm_model']} + sinyal Gemini Vision...")
         try:
             selected, score_engine, used_groq_llm = groq_rank(
-                candidates, int(clip_count), job
+                candidates, int(clip_count), job, campaign_requirements
             )
             states[current] = "done" if used_groq_llm else "warning"
         except Exception as exc:
