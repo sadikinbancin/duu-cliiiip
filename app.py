@@ -1349,10 +1349,15 @@ def make_zip(job: Path, files: list[Path]) -> Path:
     return output
 
 
-def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_ocr):
+def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_ocr, campaign_requirements=""):
     cleanup_old_jobs()
     job = ROOT / uuid.uuid4().hex
     job.mkdir(parents=True, exist_ok=True)
+
+    campaign_requirements = (campaign_requirements or "").strip()
+    campaign_path = job / "campaign_requirements.txt"
+    if campaign_requirements:
+        campaign_path.write_text(campaign_requirements, encoding="utf-8")
 
     states = {stage: "pending" for stage in STAGES}
     preview = None
@@ -1536,6 +1541,7 @@ def pipeline(upload, drive_url, clip_count, clip_duration, whisper_mode, enable_
         yield snap("Membuat ZIP hasil dan log debug...")
         debug_files = [
             job / "runtime_config.json",
+            job / "campaign_requirements.txt",
             job / "source_metadata.json",
             job / "normalization.log",
             job / "metadata.json",
@@ -1872,18 +1878,18 @@ with gr.Blocks(title="Clipping Lite Stage 4") as demo:
                     lines=2,
                 )
                 campaign_requirements = gr.Textbox(
-                  label="📋 Campaign Requirements — opsional",
-                  placeholder=(
-                    "Tempel persyaratan kampanye di sini.\n\n"
-                    "Contoh:\n"
-                    "- Speaker harus berbicara di setiap clip\n"
-                    "- Hook kuat pada 1–3 detik pertama\n"
-                    "- Bukan pure lifestyle\n"
-                    "- Edit clean, modern, dan tajam\n\n"
-                    "Kosongkan untuk mode viral biasa."
-                   ),
-               lines=9,
-               )
+    label="📋 Campaign Requirements — opsional",
+    placeholder=(
+        "Tempel persyaratan kampanye di sini.\n\n"
+        "Contoh:\n"
+        "- Speaker harus berbicara di setiap clip\n"
+        "- Hook kuat pada 1–3 detik pertama\n"
+        "- Bukan pure lifestyle\n"
+        "- Edit clean, modern, dan tajam\n\n"
+        "Kosongkan untuk mode viral biasa."
+    ),
+    lines=9,
+)
                 whisper = gr.Dropdown(
                     [
                         "Groq Whisper (disarankan)",
@@ -1912,7 +1918,7 @@ with gr.Blocks(title="Clipping Lite Stage 4") as demo:
 
         button.click(
             pipeline,
-            [upload, drive, count, duration, whisper, ocr_box],
+            [upload, drive, count, duration, whisper, ocr_box, campaign_requirements],
             [status, preview, transcript_out, clips_out, files_out],
             show_progress="full",
         )
