@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Convert MediaPipe face positions into smooth animated 9:16 crop keyframes."""
+"""Convert active-speaker face positions into smooth animated 9:16 crop keyframes."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import subprocess
 import sys
 from pathlib import Path
@@ -42,14 +41,14 @@ def interpolate_missing(values: list[float | None]) -> np.ndarray:
     return np.interp(indexes, valid, arr[valid])
 
 
-def ema(values: np.ndarray, alpha: float = 0.28) -> np.ndarray:
+def ema(values: np.ndarray, alpha: float = 0.38) -> np.ndarray:
     if values.size == 0:
         return values
     output = np.empty_like(values, dtype=np.float64)
     output[0] = values[0]
     for i in range(1, values.size):
         output[i] = alpha * values[i] + (1.0 - alpha) * output[i - 1]
-    # Forward/backward smoothing reduces delay while staying CPU-cheap.
+    # Forward/backward smoothing removes jitter without creating large lag.
     reverse = np.empty_like(output)
     reverse[-1] = output[-1]
     for i in range(output.size - 2, -1, -1):
@@ -80,12 +79,13 @@ def build_clip_crop(face_info: dict, src_w: int, src_h: int) -> dict:
 
     if not frames or detected_count == 0:
         return {
-            "strategy": "center",
+            "strategy": "center_fallback",
             "crop_w": crop_w,
             "crop_h": crop_h,
             "keyframes": [{"time": 0.0, "crop_x": center_x}],
             "detected_frames": 0,
             "total_frames": len(frames),
+            "active_speaker_switches": 0,
         }
 
     times = np.array([float(frame.get("time", 0.0)) for frame in frames])
@@ -93,16 +93,16 @@ def build_clip_crop(face_info: dict, src_w: int, src_h: int) -> dict:
         float(frame.get("face_x", 0.5)) if frame.get("detected") else None
         for frame in frames
     ]
-    face_x = ema(interpolate_missing(raw_x), alpha=0.28)
+    face_x = ema(interpolate_missing(raw_x), alpha=0.38)
 
-    # Keep the face near 43% of the vertical frame, leaving more visual room
-    # in the direction of the rest of the source frame.
-    target_ratio = 0.43
+    # Put the active speaker near the horizontal center of the vertical crop.
+    target_ratio = 0.50
     crop_x = face_x * src_w - target_ratio * crop_w
     crop_x = np.clip(crop_x, 0, max(0, src_w - crop_w))
 
-    # Dead-zone + speed limit avoids nervous camera movement.
-    max_delta = max(6.0, crop_w * 0.045)
+    # A left-to-right speaker change should take roughly 1–2 seconds instead
+    # of jumping instantly or crawling for many seconds.
+    max_delta = max(28.0, crop_w * 0.50)
     crop_x = limit_velocity(crop_x, max_delta=max_delta)
 
     keyframes = []
@@ -116,19 +116,22 @@ def build_clip_crop(face_info: dict, src_w: int, src_h: int) -> dict:
     if not keyframes:
         keyframes = [{"time": round(float(times[0]), 3), "crop_x": center_x}]
     elif keyframes[-1]["time"] != round(float(times[-1]), 3):
-        keyframes.append({"time": round(float(times[-1]), 3), "crop_x": int(round(float(crop_x[-1])))})
-
-    strategy = "face_track"
-    if face_info.get("split_screen"):
-        strategy = "face_track_multi_face"
+        keyframes.append(
+            {
+                "time": round(float(times[-1]), 3),
+                "crop_x": int(round(float(crop_x[-1]))),
+            }
+        )
 
     return {
-        "strategy": strategy,
+        "strategy": "active_speaker_face_track",
         "crop_w": crop_w,
         "crop_h": crop_h,
         "keyframes": keyframes,
         "detected_frames": detected_count,
         "total_frames": len(frames),
+        "active_speaker_switches": int(face_info.get("active_speaker_switches", 0)),
+        "multi_face_ratio": float(face_info.get("multi_face_ratio", 0.0)),
     }
 
 
@@ -150,7 +153,8 @@ def main():
         "metadata": {
             "src_w": src_w,
             "src_h": src_h,
-            "engine": "animated-face-crop-v2",
+            "engine": "active-speaker-crop-v1",
+            "layout": "single-speaker-fullscreen",
         },
     }
 
@@ -161,7 +165,8 @@ def main():
         output["clips"][clip_id] = crop_info
         print(
             f"Clip {clip_id}: {crop_info['strategy']}, "
-            f"{len(crop_info['keyframes'])} keyframes",
+            f"{len(crop_info['keyframes'])} keyframes, "
+            f"{crop_info.get('active_speaker_switches', 0)} switches",
             flush=True,
         )
 
