@@ -36,4 +36,4 @@ COPY . .
 
 EXPOSE 7860
 
-CMD ["python", "app.py"]
+CMD ["python", "start.py"]
